@@ -1,0 +1,942 @@
+const { app, BrowserWindow, ipcMain, screen, dialog, shell } = require('electron');
+const path = require('path');
+const os = require('os');
+const fs = require('fs');
+const pty = require('node-pty');
+
+let mainWindow = null;
+const runningProcesses = new Map();
+const processBuffers = new Map(); // id → { ansiFragment: string } — ANSI 분할 방지 버퍼
+let resolvedCliPaths = {}; // command name → resolved absolute path 캐시
+const MAX_FILE_IMPORT_BYTES = 180 * 1024;
+let codexRateLimitCache = {
+  ts: 0,
+  filePath: '',
+  fileMtime: 0,
+  result: null,
+};
+
+// ANSI 이스케이프 시퀀스 + 터미널 제어문자 제거
+function stripAnsi(text) {
+  return text
+    // CSI sequences: ESC[...X
+    .replace(/\x1B\[[0-9;]*[A-Za-z]/g, '')
+    // OSC sequences: ESC]...BEL or ESC]...ST
+    .replace(/\x1B\].*?(?:\x07|\x1B\\)/g, '')
+    // DEC private modes: ESC[?...h/l
+    .replace(/\x1B\[\?[0-9;]*[hl]/g, '')
+    // Character set: ESC(X
+    .replace(/\x1B\([A-Z0-9]/g, '')
+    // Other ESC sequences
+    .replace(/\x1B[=>MNOP78]/g, '')
+    // Remaining control chars (except \n, \r, \t)
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F]/g, '')
+    // UTF-8 디코딩 실패 replacement 문자 제거
+    .replace(/\uFFFD/g, '');
+}
+
+// 미완성 ANSI 시퀀스 감지: 문자열 끝에 잘린 ESC 시퀀스가 있으면 분리
+function splitAnsiSafe(text) {
+  // 끝에서 ESC(\x1B) 이후 완성되지 않은 시퀀스 찾기
+  const lastEsc = text.lastIndexOf('\x1B');
+  if (lastEsc === -1) return { clean: text, fragment: '' };
+
+  const after = text.substring(lastEsc);
+  // 완성된 ANSI 시퀀스인지 확인
+  if (/^\x1B\[[0-9;]*[A-Za-z]/.test(after)) return { clean: text, fragment: '' };
+  if (/^\x1B\].*?(?:\x07|\x1B\\)/.test(after)) return { clean: text, fragment: '' };
+  if (/^\x1B\[\?[0-9;]*[hl]/.test(after)) return { clean: text, fragment: '' };
+  if (/^\x1B\([A-Z0-9]/.test(after)) return { clean: text, fragment: '' };
+  if (/^\x1B[=>MNOP78]/.test(after)) return { clean: text, fragment: '' };
+
+  // 미완성 → 분리
+  return { clean: text.substring(0, lastEsc), fragment: after };
+}
+
+function resolveFilePath(inputPath) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) return '';
+  const cleaned = raw.replace(/^['"]|['"]$/g, '');
+  return path.normalize(path.isAbsolute(cleaned) ? cleaned : path.join(workingDirectory, cleaned));
+}
+
+function resolveOpenFileTarget(inputPath) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) return { resolvedPath: '', line: null };
+
+  let value = raw.replace(/^['"]|['"]$/g, '');
+  let line = null;
+
+  const lineMatch = /#L(\d+)$/i.exec(value);
+  if (lineMatch) {
+    const parsedLine = Number(lineMatch[1]);
+    line = Number.isFinite(parsedLine) && parsedLine > 0 ? parsedLine : null;
+    value = value.slice(0, lineMatch.index);
+  }
+
+  if (/^file:\/\//i.test(value)) {
+    try {
+      const fileUrl = new URL(value);
+      value = decodeURIComponent(fileUrl.pathname || '');
+    } catch {
+      // invalid file url - fallback to raw path parsing
+    }
+  } else {
+    try {
+      value = decodeURIComponent(value);
+    } catch {
+      // ignore malformed percent encoding
+    }
+  }
+
+  // renderer에서 /C:/... 형식으로 전달하는 Windows 절대경로 보정
+  if (/^\/[A-Za-z]:\//.test(value)) {
+    value = value.slice(1);
+  }
+
+  // URL 형태로 전달된 경로를 OS 경로 형태로 복원
+  if (value.includes('/')) {
+    value = value.replace(/\//g, path.sep);
+  }
+
+  return {
+    resolvedPath: resolveFilePath(value),
+    line,
+  };
+}
+
+function readTextFilePreview(targetPath) {
+  try {
+    if (!fs.existsSync(targetPath)) {
+      return { success: false, error: '파일을 찾을 수 없습니다.' };
+    }
+
+    const stat = fs.statSync(targetPath);
+    if (!stat.isFile()) {
+      return { success: false, error: '파일 경로가 올바르지 않습니다.' };
+    }
+
+    const readBytes = Math.min(stat.size, MAX_FILE_IMPORT_BYTES);
+    const fd = fs.openSync(targetPath, 'r');
+    const buffer = Buffer.alloc(readBytes);
+
+    try {
+      fs.readSync(fd, buffer, 0, readBytes, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    if (buffer.includes(0)) {
+      return { success: false, error: '텍스트 파일만 불러올 수 있습니다.' };
+    }
+
+    return {
+      success: true,
+      path: targetPath,
+      content: buffer.toString('utf8'),
+      size: stat.size,
+      truncated: stat.size > MAX_FILE_IMPORT_BYTES,
+      maxBytes: MAX_FILE_IMPORT_BYTES,
+    };
+  } catch (error) {
+    return { success: false, error: error.message || '파일을 읽는 중 오류가 발생했습니다.' };
+  }
+}
+
+// --- 작업 디렉토리 관리 ---
+let workingDirectory = os.homedir();
+
+function resolveInitialCwd() {
+  // 1순위: --cwd 명령줄 인자
+  const args = process.argv.slice(1);
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === '--cwd' && args[i + 1]) {
+      const dir = args[i + 1];
+      if (fs.existsSync(dir)) return dir;
+    }
+    if (args[i].startsWith('--cwd=')) {
+      const dir = args[i].slice(6);
+      if (fs.existsSync(dir)) return dir;
+    }
+  }
+
+  // 2순위: 마지막 인자가 존재하는 폴더 경로이면 사용
+  const lastArg = args[args.length - 1];
+  if (lastArg && !lastArg.startsWith('-')) {
+    try {
+      const stat = fs.statSync(lastArg);
+      if (stat.isDirectory()) return lastArg;
+    } catch { /* ignore */ }
+  }
+
+  return os.homedir();
+}
+
+function createWindow() {
+  workingDirectory = resolveInitialCwd();
+
+  const { width, height } = screen.getPrimaryDisplay().workAreaSize;
+
+  mainWindow = new BrowserWindow({
+    width: Math.min(1100, Math.floor(width * 0.7)),
+    height: Math.min(850, Math.floor(height * 0.85)),
+    minWidth: 500,
+    minHeight: 400,
+    frame: false,
+    transparent: false,
+    backgroundColor: '#0C0C1E',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: false,
+    },
+    show: false,
+  });
+
+  mainWindow.loadFile(path.join(__dirname, 'renderer', 'index.html'));
+
+  // 렌더러 로그 캡처
+  mainWindow.webContents.on('console-message', (e, level, msg, line, src) => {
+    const tag = ['LOG', 'WARN', 'ERR'][level] || 'LOG';
+    console.log(`[R:${tag}] ${msg}`);
+  });
+
+  mainWindow.on('maximize', () => {
+    mainWindow.webContents.send('window:maximized', true);
+  });
+  mainWindow.on('unmaximize', () => {
+    mainWindow.webContents.send('window:maximized', false);
+  });
+
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    if (input.key === 'F12') mainWindow.webContents.toggleDevTools();
+    if (input.key === 'F11') mainWindow.setFullScreen(!mainWindow.isFullScreen());
+  });
+
+  mainWindow.once('ready-to-show', () => mainWindow.show());
+
+  mainWindow.on('closed', () => {
+    for (const [id, proc] of runningProcesses) {
+      try { proc.kill(); } catch (e) { /* ignore */ }
+    }
+    runningProcesses.clear();
+    processBuffers.clear();
+    mainWindow = null;
+  });
+}
+
+// --- CLI 경로 자동 탐색 ---
+function resolveCliPath(command) {
+  // 이미 절대 경로면 그대로
+  if (command.includes('\\') || command.includes('/')) {
+    if (fs.existsSync(command)) return command;
+    if (fs.existsSync(command + '.cmd')) return command + '.cmd';
+    if (fs.existsSync(command + '.exe')) return command + '.exe';
+    return command;
+  }
+
+  // 캐시 확인
+  if (resolvedCliPaths[command]) {
+    if (fs.existsSync(resolvedCliPaths[command])) return resolvedCliPaths[command];
+    delete resolvedCliPaths[command];
+  }
+
+  const isWin = process.platform === 'win32';
+  const extensions = isWin ? ['.cmd', '.exe', ''] : [''];
+  const candidates = [];
+
+  // 1. npm global 경로 (npm prefix -g)
+  try {
+    const { execSync } = require('child_process');
+    const npmGlobal = execSync('npm prefix -g', { encoding: 'utf8', timeout: 5000 }).trim();
+    if (npmGlobal) {
+      for (const ext of extensions) {
+        candidates.push(path.join(npmGlobal, command + ext));
+        if (isWin) candidates.push(path.join(npmGlobal, 'node_modules', '.bin', command + ext));
+      }
+    }
+  } catch { /* ignore */ }
+
+  // 2. %APPDATA%\npm (Windows npm global 기본 경로)
+  if (isWin) {
+    const appData = process.env.APPDATA;
+    if (appData) {
+      for (const ext of extensions) {
+        candidates.push(path.join(appData, 'npm', command + ext));
+      }
+    }
+  }
+
+  // 3. nvm / fnm / volta 등 버전 관리자 경로
+  const homedir = os.homedir();
+  const extraDirs = isWin
+    ? [
+        path.join(homedir, '.nvm', 'versions'),
+        path.join(homedir, 'scoop', 'shims'),
+        path.join(homedir, 'scoop', 'apps', 'nodejs', 'current'),
+        path.join(homedir, '.volta', 'bin'),
+        path.join(homedir, '.fnm', 'node-versions'),
+      ]
+    : [
+        path.join(homedir, '.nvm', 'versions'),
+        path.join(homedir, '.volta', 'bin'),
+        path.join(homedir, '.fnm', 'node-versions'),
+        '/usr/local/bin',
+        '/usr/bin',
+      ];
+
+  for (const dir of extraDirs) {
+    for (const ext of extensions) {
+      candidates.push(path.join(dir, command + ext));
+    }
+  }
+
+  // 4. PATH 환경변수에서 직접 탐색
+  const pathDirs = (process.env.PATH || '').split(isWin ? ';' : ':');
+  for (const dir of pathDirs) {
+    if (!dir) continue;
+    for (const ext of extensions) {
+      candidates.push(path.join(dir, command + ext));
+    }
+  }
+
+  // 후보 중 실제 존재하는 첫 번째 반환
+  for (const candidate of candidates) {
+    try {
+      if (fs.existsSync(candidate)) {
+        console.log(`[CLI] resolved '${command}' → ${candidate}`);
+        resolvedCliPaths[command] = candidate;
+        return candidate;
+      }
+    } catch { /* ignore */ }
+  }
+
+  // 못 찾으면 원래 이름 + .cmd (기존 동작)
+  console.log(`[CLI] could not resolve '${command}', falling back to '${command}.cmd'`);
+  return isWin ? `${command}.cmd` : command;
+}
+
+// --- CLI 실행 (node-pty 기반 PTY) ---
+ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
+  const shell = profile.command;
+  const promptText = typeof prompt === 'string' ? prompt : '';
+  const args = promptText
+    ? [...(profile.args || []), '--', promptText]
+    : [...(profile.args || [])];
+  const runCwd = cwd || workingDirectory;
+
+  console.log(`[CLI] run id=${id} shell=${shell} args=${JSON.stringify(args)} cwd=${runCwd}`);
+
+  try {
+    const env = { ...process.env, ...(profile.env || {}), FORCE_COLOR: '0' };
+    delete env.CLAUDECODE;
+    delete env.CLAUDE_CODE;
+
+    // CLI 경로 자동 탐색 (npm global, PATH 등)
+    const resolvedShell = resolveCliPath(shell);
+    const proc = pty.spawn(resolvedShell, args, {
+      name: 'xterm-256color',
+      cols: 120,
+      rows: 30,
+      cwd: runCwd,
+      env,
+    });
+
+    runningProcesses.set(id, proc);
+    processBuffers.set(id, { ansiFragment: '' });
+
+    proc.onData((data) => {
+      const buf = processBuffers.get(id);
+      if (!buf) return;
+
+      // node-pty(Windows)는 이미 디코딩된 문자열을 전달 → 문자열 기반 처리
+      // 이전 미완성 ANSI 시퀀스와 결합
+      const textWithPrev = buf.ansiFragment + data;
+      const { clean: safeText, fragment } = splitAnsiSafe(textWithPrev);
+      buf.ansiFragment = fragment;
+
+      if (!safeText) return;
+
+      const clean = stripAnsi(safeText);
+      if (clean && mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+      }
+    });
+
+    proc.onExit(({ exitCode }) => {
+      console.log(`[CLI] exit id=${id} code=${exitCode}`);
+
+      // 잔여 ANSI 프래그먼트 플러시
+      const buf = processBuffers.get(id);
+      if (buf && buf.ansiFragment && mainWindow && !mainWindow.isDestroyed()) {
+        const clean = stripAnsi(buf.ansiFragment);
+        if (clean) {
+          mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+        }
+      }
+      processBuffers.delete(id);
+      runningProcesses.delete(id);
+
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('cli:done', { id, code: exitCode });
+      }
+    });
+
+    // 즉시 반환 - 스트리밍은 이벤트로 처리
+    return { success: true, id };
+
+  } catch (err) {
+    console.log(`[CLI] error id=${id} err=${err.message}`);
+    return { success: false, error: err.message };
+  }
+});
+
+// CLI 프로세스에 입력 전송
+ipcMain.handle('cli:write', (event, { id, data }) => {
+  const proc = runningProcesses.get(id);
+  if (proc) {
+    proc.write(data);
+    return { success: true };
+  }
+  return { success: false };
+});
+
+// CLI 프로세스 중지
+ipcMain.handle('cli:stop', (event, { id }) => {
+  const proc = runningProcesses.get(id);
+  if (proc) {
+    try {
+      proc.write('\x03'); // Ctrl+C 시그널
+      proc.kill();
+    } catch (e) { /* ignore */ }
+    processBuffers.delete(id);
+    runningProcesses.delete(id);
+    return { success: true };
+  }
+  return { success: false };
+});
+
+// --- 작업 디렉토리 ---
+ipcMain.handle('cwd:get', () => workingDirectory);
+
+ipcMain.handle('cwd:set', (event, dir) => {
+  if (fs.existsSync(dir)) {
+    workingDirectory = dir;
+    return { success: true, cwd: dir };
+  }
+  return { success: false, error: 'Directory not found' };
+});
+
+ipcMain.handle('cwd:select', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '작업 폴더 선택',
+    defaultPath: workingDirectory,
+    properties: ['openDirectory'],
+  });
+  if (!result.canceled && result.filePaths.length > 0) {
+    workingDirectory = result.filePaths[0];
+    return { success: true, cwd: workingDirectory };
+  }
+  return { success: false };
+});
+
+ipcMain.handle('file:pickAndRead', async () => {
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '불러올 파일 선택',
+    defaultPath: workingDirectory,
+    properties: ['openFile'],
+  });
+
+  if (result.canceled || result.filePaths.length === 0) {
+    return { success: false, canceled: true, error: '파일 선택이 취소되었습니다.' };
+  }
+
+  return readTextFilePreview(result.filePaths[0]);
+});
+
+ipcMain.handle('file:read', (event, { filePath }) => {
+  const resolvedPath = resolveFilePath(filePath);
+  if (!resolvedPath) {
+    return { success: false, error: '파일 경로를 입력하세요.' };
+  }
+  return readTextFilePreview(resolvedPath);
+});
+
+ipcMain.handle('file:open', async (event, { filePath }) => {
+  const { resolvedPath, line } = resolveOpenFileTarget(filePath);
+  if (!resolvedPath) {
+    return { success: false, error: '파일 경로를 입력하세요.' };
+  }
+
+  try {
+    if (!fs.existsSync(resolvedPath)) {
+      return { success: false, error: '파일을 찾을 수 없습니다.' };
+    }
+    const stat = fs.statSync(resolvedPath);
+    if (!stat.isFile()) {
+      return { success: false, error: '파일 경로가 올바르지 않습니다.' };
+    }
+
+    const openError = await shell.openPath(resolvedPath);
+    if (openError) {
+      return { success: false, error: openError };
+    }
+
+    return { success: true, path: resolvedPath, line };
+  } catch (error) {
+    return { success: false, error: error.message || '파일을 여는 중 오류가 발생했습니다.' };
+  }
+});
+
+// 윈도우 컨트롤
+ipcMain.on('window:minimize', () => mainWindow?.minimize());
+ipcMain.on('window:maximize', () => {
+  if (mainWindow) {
+    mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+  }
+});
+ipcMain.on('window:close', () => mainWindow?.close());
+ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
+
+// --- Codex rate_limits 읽기 (세션 JSONL에서) ---
+ipcMain.handle('codex:rateLimits', () => {
+  try {
+    const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
+    if (!fs.existsSync(sessionsDir)) return { success: false, error: 'no sessions dir' };
+
+    // 최신 날짜 폴더 탐색 (YYYY/MM/DD)
+    const years = fs.readdirSync(sessionsDir).sort().reverse();
+    let latestFile = null;
+    let latestMtime = 0;
+
+    for (const year of years.slice(0, 2)) {
+      const yearDir = path.join(sessionsDir, year);
+      if (!fs.statSync(yearDir).isDirectory()) continue;
+      const months = fs.readdirSync(yearDir).sort().reverse();
+      for (const month of months.slice(0, 2)) {
+        const monthDir = path.join(yearDir, month);
+        if (!fs.statSync(monthDir).isDirectory()) continue;
+        const days = fs.readdirSync(monthDir).sort().reverse();
+        for (const day of days.slice(0, 2)) {
+          const dayDir = path.join(monthDir, day);
+          if (!fs.statSync(dayDir).isDirectory()) continue;
+          const files = fs.readdirSync(dayDir)
+            .filter(f => f.endsWith('.jsonl'))
+            .map(f => {
+              const fp = path.join(dayDir, f);
+              return { path: fp, mtime: fs.statSync(fp).mtimeMs };
+            })
+            .sort((a, b) => b.mtime - a.mtime);
+          if (files.length > 0 && files[0].mtime > latestMtime) {
+            latestFile = files[0].path;
+            latestMtime = files[0].mtime;
+          }
+        }
+        if (latestFile) break;
+      }
+      if (latestFile) break;
+    }
+
+    if (!latestFile) return { success: false, error: 'no session files' };
+    const latestStat = fs.statSync(latestFile);
+    const now = Date.now();
+    if (
+      codexRateLimitCache.result &&
+      now - codexRateLimitCache.ts < 15000 &&
+      codexRateLimitCache.filePath === latestFile &&
+      codexRateLimitCache.fileMtime === latestStat.mtimeMs
+    ) {
+      return codexRateLimitCache.result;
+    }
+
+    // 파일 전체를 읽으면 UI가 멈출 수 있으므로, 파일 tail만 단계적으로 읽어 마지막 rate_limits를 찾는다.
+    const stat = latestStat;
+    if (!stat.isFile() || stat.size <= 0) return { success: false, error: 'empty session file' };
+
+    const chunkSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024]; // 256KB -> 1MB -> 4MB
+    for (const chunkSize of chunkSizes) {
+      const bytesToRead = Math.min(stat.size, chunkSize);
+      const start = Math.max(0, stat.size - bytesToRead);
+      const fd = fs.openSync(latestFile, 'r');
+      let content = '';
+      try {
+        const buffer = Buffer.alloc(bytesToRead);
+        fs.readSync(fd, buffer, 0, bytesToRead, start);
+        content = buffer.toString('utf8');
+      } finally {
+        fs.closeSync(fd);
+      }
+
+      const lines = content.split('\n').reverse();
+      for (const line of lines) {
+        if (!line || !line.includes('rate_limits')) continue;
+        try {
+          const obj = JSON.parse(line);
+          const rl = obj?.payload?.rate_limits;
+          if (rl && rl.primary && rl.secondary) {
+            const resolved = {
+              success: true,
+              h5Used: rl.primary.used_percent,
+              weeklyUsed: rl.secondary.used_percent,
+              h5Remaining: Math.max(0, 100 - rl.primary.used_percent),
+              weeklyRemaining: Math.max(0, 100 - rl.secondary.used_percent),
+              h5Window: rl.primary.window_minutes,
+              weeklyWindow: rl.secondary.window_minutes,
+              h5ResetsAt: rl.primary.resets_at,
+              weeklyResetsAt: rl.secondary.resets_at,
+            };
+            codexRateLimitCache = {
+              ts: now,
+              filePath: latestFile,
+              fileMtime: stat.mtimeMs,
+              result: resolved,
+            };
+            return resolved;
+          }
+        } catch { /* malformed json line */ }
+      }
+    }
+
+    return { success: false, error: 'no rate_limits found' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+function getCodexSessionsDir() {
+  return path.join(os.homedir(), '.codex', 'sessions');
+}
+
+function listCodexSessionFiles() {
+  const sessionsDir = getCodexSessionsDir();
+  if (!fs.existsSync(sessionsDir)) return [];
+
+  const files = [];
+  const years = fs.readdirSync(sessionsDir).sort().reverse();
+  for (const year of years) {
+    const yearDir = path.join(sessionsDir, year);
+    if (!fs.existsSync(yearDir) || !fs.statSync(yearDir).isDirectory()) continue;
+    const months = fs.readdirSync(yearDir).sort().reverse();
+    for (const month of months) {
+      const monthDir = path.join(yearDir, month);
+      if (!fs.existsSync(monthDir) || !fs.statSync(monthDir).isDirectory()) continue;
+      const days = fs.readdirSync(monthDir).sort().reverse();
+      for (const day of days) {
+        const dayDir = path.join(monthDir, day);
+        if (!fs.existsSync(dayDir) || !fs.statSync(dayDir).isDirectory()) continue;
+        const dayFiles = fs.readdirSync(dayDir)
+          .filter(name => name.endsWith('.jsonl'))
+          .map(name => {
+            const filePath = path.join(dayDir, name);
+            const stat = fs.statSync(filePath);
+            return { filePath, name, mtimeMs: stat.mtimeMs, size: stat.size };
+          });
+        files.push(...dayFiles);
+      }
+    }
+  }
+
+  return files.sort((a, b) => b.mtimeMs - a.mtimeMs);
+}
+
+function normalizePreviewText(text, maxLen = 140) {
+  const compact = String(text || '').replace(/\s+/g, ' ').trim();
+  if (!compact) return '';
+  return compact.length > maxLen ? `${compact.slice(0, maxLen - 3)}...` : compact;
+}
+
+function isIgnorableSessionUserText(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return true;
+  if (/^#\s*AGENTS\.md instructions\b/i.test(trimmed)) return true;
+  if (/^<environment_context>/i.test(trimmed)) return true;
+  if (/^<collaboration_mode>/i.test(trimmed)) return true;
+  if (/^<permissions instructions>/i.test(trimmed)) return true;
+  return false;
+}
+
+function extractMessageTextFromContent(content) {
+  if (!Array.isArray(content)) return '';
+  const parts = [];
+  for (const item of content) {
+    if (!item || typeof item !== 'object') continue;
+    const text = typeof item.text === 'string'
+      ? item.text
+      : typeof item.output_text === 'string'
+        ? item.output_text
+        : typeof item.input_text === 'string'
+          ? item.input_text
+          : '';
+    if (text && text.trim()) parts.push(text);
+  }
+  return parts.join('\n').trim();
+}
+
+function parseSessionPreview(filePath, fileSize, fileName) {
+  let sessionId = '';
+  let cwd = '';
+  let startedAt = '';
+  let description = '';
+
+  try {
+    const bytes = Math.min(fileSize, 192 * 1024);
+    if (bytes > 0) {
+      const fd = fs.openSync(filePath, 'r');
+      try {
+        const buffer = Buffer.alloc(bytes);
+        fs.readSync(fd, buffer, 0, bytes, 0);
+        const lines = buffer.toString('utf8').split('\n');
+        for (const line of lines) {
+          if (!line) continue;
+          try {
+            const obj = JSON.parse(line);
+            if (obj?.type === 'session_meta') {
+              const payload = obj?.payload || {};
+              if (typeof payload.id === 'string' && payload.id) sessionId = payload.id;
+              if (typeof payload.cwd === 'string' && payload.cwd) cwd = payload.cwd;
+              if (typeof payload.timestamp === 'string' && payload.timestamp) startedAt = payload.timestamp;
+              continue;
+            }
+            if (!description && obj?.type === 'response_item' && obj?.payload?.type === 'message' && obj?.payload?.role === 'user') {
+              const text = extractMessageTextFromContent(obj?.payload?.content);
+              if (!isIgnorableSessionUserText(text)) {
+                description = normalizePreviewText(text, 140);
+              }
+            }
+          } catch { /* malformed json line */ }
+          if (sessionId && description) break;
+        }
+      } finally {
+        fs.closeSync(fd);
+      }
+    }
+  } catch {
+    // ignore preview parsing errors
+  }
+
+  if (!sessionId) {
+    const m = fileName.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+    if (m) sessionId = m[1];
+  }
+
+  return { sessionId, cwd, startedAt, description };
+}
+
+function resolveCodexSessionFilePath(sessionId, preferredPath) {
+  const wanted = String(sessionId || '').trim().toLowerCase();
+  if (!wanted) return '';
+
+  if (preferredPath && typeof preferredPath === 'string' && fs.existsSync(preferredPath)) {
+    const lowerName = path.basename(preferredPath).toLowerCase();
+    if (lowerName.includes(wanted)) return preferredPath;
+  }
+
+  const files = listCodexSessionFiles();
+  for (const file of files) {
+    if (file.name.toLowerCase().includes(wanted)) return file.filePath;
+  }
+
+  for (const file of files) {
+    const preview = parseSessionPreview(file.filePath, file.size, file.name);
+    if (preview.sessionId && preview.sessionId.toLowerCase() === wanted) {
+      return file.filePath;
+    }
+  }
+  return '';
+}
+
+function parseCodexSessionConversation(filePath, options = {}) {
+  const includeCommentary = options.includeCommentary === true;
+  const includeIgnorablePrompts = options.includeIgnorablePrompts === true;
+  const result = {
+    id: '',
+    cwd: '',
+    startedAt: '',
+    description: '',
+    messages: [],
+  };
+
+  const raw = fs.readFileSync(filePath, 'utf8');
+  const lines = raw.split('\n');
+
+  for (const line of lines) {
+    if (!line) continue;
+    let obj;
+    try {
+      obj = JSON.parse(line);
+    } catch {
+      continue;
+    }
+
+    if (obj?.type === 'session_meta') {
+      const payload = obj?.payload || {};
+      if (typeof payload.id === 'string' && payload.id) result.id = payload.id;
+      if (typeof payload.cwd === 'string' && payload.cwd) result.cwd = payload.cwd;
+      if (typeof payload.timestamp === 'string' && payload.timestamp) result.startedAt = payload.timestamp;
+      continue;
+    }
+
+    if (obj?.type !== 'response_item' || obj?.payload?.type !== 'message') continue;
+
+    const role = obj?.payload?.role;
+    if (role !== 'user' && role !== 'assistant') continue;
+    const text = extractMessageTextFromContent(obj?.payload?.content);
+    if (!text) continue;
+
+    if (role === 'user' && !includeIgnorablePrompts && isIgnorableSessionUserText(text)) continue;
+    if (role === 'assistant') {
+      const phase = String(obj?.payload?.phase || '').toLowerCase();
+      if (!includeCommentary && phase === 'commentary') continue;
+    }
+
+    if (!result.description && role === 'user') {
+      if (!isIgnorableSessionUserText(text)) {
+        result.description = normalizePreviewText(text, 140);
+      }
+    }
+
+    const tsRaw = Date.parse(String(obj?.timestamp || ''));
+    result.messages.push({
+      role: role === 'user' ? 'user' : 'ai',
+      content: text,
+      timestamp: Number.isFinite(tsRaw) ? tsRaw : Date.now(),
+    });
+  }
+
+  if (!result.id) {
+    const name = path.basename(filePath);
+    const m = name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+    if (m) result.id = m[1];
+  }
+
+  return result;
+}
+
+// --- Codex 세션 목록 읽기 (~/.codex/sessions) ---
+ipcMain.handle('codex:listSessions', (event, limitArg) => {
+  try {
+    const limitNum = Number(limitArg);
+    const limit = Number.isFinite(limitNum)
+      ? Math.min(200, Math.max(1, Math.floor(limitNum)))
+      : 60;
+
+    const files = listCodexSessionFiles();
+    const limitedFiles = files.slice(0, limit * 3);
+    const dedup = new Map();
+
+    for (const file of limitedFiles) {
+      const preview = parseSessionPreview(file.filePath, file.size, file.name);
+      const sessionId = preview.sessionId;
+      if (!sessionId || dedup.has(sessionId)) continue;
+
+      const title = `세션 ${sessionId.slice(0, 8)}`;
+      dedup.set(sessionId, {
+        id: sessionId,
+        title,
+        description: preview.description || '',
+        cwd: preview.cwd || '',
+        startedAt: preview.startedAt || '',
+        updatedAt: file.mtimeMs,
+        filePath: file.filePath,
+      });
+
+      if (dedup.size >= limit) break;
+    }
+
+    return { success: true, data: Array.from(dedup.values()) };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// --- Codex 세션 대화 복원 ---
+ipcMain.handle('codex:loadSession', (event, arg) => {
+  try {
+    const sessionId = typeof arg === 'string'
+      ? arg.trim()
+      : typeof arg?.sessionId === 'string'
+        ? arg.sessionId.trim()
+        : '';
+    const preferredPath = typeof arg?.filePath === 'string' ? arg.filePath : '';
+    const modeRaw = typeof arg?.mode === 'string' && arg.mode.toLowerCase() === 'raw';
+
+    if (!sessionId) return { success: false, error: 'session id required' };
+
+    const filePath = resolveCodexSessionFilePath(sessionId, preferredPath);
+    if (!filePath) return { success: false, error: 'session file not found' };
+
+    const parsed = parseCodexSessionConversation(filePath, {
+      includeCommentary: modeRaw,
+      includeIgnorablePrompts: modeRaw,
+    });
+    const resolvedId = parsed.id || sessionId;
+    return {
+      success: true,
+      data: {
+        id: resolvedId,
+        title: parsed.description ? normalizePreviewText(parsed.description, 70) : `세션 ${resolvedId.slice(0, 8)}`,
+        description: parsed.description || '',
+        cwd: parsed.cwd || '',
+        startedAt: parsed.startedAt || '',
+        updatedAt: fs.statSync(filePath).mtimeMs,
+        filePath,
+        mode: modeRaw ? 'raw' : 'default',
+        messages: parsed.messages,
+      },
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 시스템 정보
+ipcMain.handle('system:info', () => ({
+  platform: process.platform,
+  username: os.userInfo().username,
+  homedir: os.homedir(),
+}));
+
+// --- 대화 데이터 파일 기반 저장/로드 ---
+function getConversationsPath() {
+  return path.join(app.getPath('userData'), 'conversations.json');
+}
+
+ipcMain.handle('store:loadConversations', () => {
+  try {
+    const filePath = getConversationsPath();
+    if (!fs.existsSync(filePath)) return { success: true, data: [] };
+    const raw = fs.readFileSync(filePath, 'utf8');
+    const parsed = JSON.parse(raw);
+    return { success: true, data: Array.isArray(parsed) ? parsed : [] };
+  } catch (err) {
+    console.error('[store] loadConversations error:', err.message);
+    return { success: false, data: [], error: err.message };
+  }
+});
+
+ipcMain.handle('store:saveConversations', (event, data) => {
+  try {
+    const filePath = getConversationsPath();
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 0), 'utf8');
+    return { success: true };
+  } catch (err) {
+    console.error('[store] saveConversations error:', err.message);
+    return { success: false, error: err.message };
+  }
+});
+
+// 동기 저장 — beforeunload에서 호출 (앱 종료 시 스트리밍 중 데이터 보존)
+ipcMain.on('store:saveConversationsSync', (event, data) => {
+  try {
+    const filePath = getConversationsPath();
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 0), 'utf8');
+    event.returnValue = { success: true };
+  } catch (err) {
+    console.error('[store] saveConversationsSync error:', err.message);
+    event.returnValue = { success: false, error: err.message };
+  }
+});
+
+app.whenReady().then(createWindow);
+app.on('window-all-closed', () => app.quit());
