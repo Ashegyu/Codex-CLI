@@ -1350,14 +1350,26 @@ body.sidebar-resizing * {
 
 .msg-body .code-block-wrapper.is-diff .diff-line {
   display: grid;
-  grid-template-columns: 1.3em minmax(0, 1fr);
-  column-gap: 0.2em;
-  padding: 1px 16px 1px 12px;
+  grid-template-columns: 3.8em 1.3em minmax(0, 1fr);
+  column-gap: 0.35em;
+  padding: 1px 16px 1px 8px;
   min-height: 1.55em;
   font-family: var(--mono);
   white-space: pre;
   border-left: 3px solid transparent;
-  transition: background 0.1s;
+  counter-increment: diff-line;
+  transition: color 0.1s, background 0.1s, border-color 0.1s;
+}
+
+.msg-body .code-block-wrapper.is-diff .diff-line::before {
+  content: counter(diff-line);
+  display: block;
+  text-align: right;
+  color: #80869b;
+  opacity: 0.9;
+  padding-right: 8px;
+  border-right: 1px solid rgba(255, 255, 255, 0.07);
+  user-select: none;
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line .diff-sign {
@@ -1389,21 +1401,27 @@ body.sidebar-resizing * {
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-add {
-  color: #a8f0b8;
-  background: rgba(46, 160, 67, 0.18);
-  border-left-color: #3fb950;
+  color: #84f7a1;
+  background: transparent;
+  border-left-color: rgba(63, 185, 80, 0.55);
 }
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-add .diff-sign {
   color: #56d364;
 }
+.msg-body .code-block-wrapper.is-diff .diff-line.diff-add .diff-text {
+  color: #84f7a1;
+}
 
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-del {
-  color: #ffc0b9;
-  background: rgba(248, 81, 73, 0.18);
-  border-left-color: #f85149;
+  color: #ff9b95;
+  background: transparent;
+  border-left-color: rgba(248, 81, 73, 0.6);
 }
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-del .diff-sign {
   color: #f85149;
+}
+.msg-body .code-block-wrapper.is-diff .diff-line.diff-del .diff-text {
+  color: #ff9b95;
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line:hover {
@@ -1426,7 +1444,7 @@ body.sidebar-resizing * {
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-file-header .diff-text {
-  grid-column: 1 / -1;
+  grid-column: 2 / -1;
 }
 
 /* 테이블 */

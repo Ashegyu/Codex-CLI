@@ -382,6 +382,79 @@
     }
   }
 
+  function isLikelyDiffCodeBlock(text, parsedLang) {
+    const lang = String(parsedLang || '').trim().toLowerCase();
+    if (lang === 'diff' || lang === 'patch') return true;
+
+    const lines = String(text || '').split(/\r?\n/).slice(0, 240);
+    let plus = 0;
+    let minus = 0;
+    let meta = 0;
+
+    for (const rawLine of lines) {
+      if (isLikelyDiffMetaLine(rawLine)) {
+        meta += 1;
+        continue;
+      }
+      if (/^\+[^+]/.test(rawLine)) {
+        plus += 1;
+      } else if (/^-[^-]/.test(rawLine)) {
+        minus += 1;
+      }
+    }
+
+    if (meta > 0 && (plus + minus) > 0) return true;
+    return plus > 0 && minus > 0 && (plus + minus) >= 3;
+  }
+
+  function classifyDiffLineForRender(rawLine) {
+    const line = String(rawLine ?? '');
+    const trimmed = line.trim();
+
+    if (/^(?:diff --git|diff --cc|diff --combined)\b/i.test(trimmed)
+      || /^\*{3}\s*(?:Update|Add|Delete)\s+File:/i.test(trimmed)
+      || /^\*{3}\s*Move to:/i.test(trimmed)) {
+      return { className: 'diff-file-header', sign: '', text: line };
+    }
+
+    if (isLikelyDiffMetaLine(trimmed)) {
+      if (/^---\s+/.test(line)) return { className: 'diff-meta', sign: '---', text: line.slice(4) };
+      if (/^\+\+\+\s+/.test(line)) return { className: 'diff-meta', sign: '+++', text: line.slice(4) };
+      if (/^@@/.test(line)) return { className: 'diff-meta', sign: '@@', text: line.replace(/^@@+\s*/, '') };
+      return { className: 'diff-meta', sign: '', text: line };
+    }
+
+    if (/^\+/.test(line) && !/^\+\+\+/.test(line)) {
+      return { className: 'diff-add', sign: '+', text: line.slice(1) };
+    }
+    if (/^-/.test(line) && !/^---/.test(line)) {
+      return { className: 'diff-del', sign: '-', text: line.slice(1) };
+    }
+    if (/^ /.test(line)) {
+      return { className: 'diff-context', sign: ' ', text: line.slice(1) };
+    }
+
+    return { className: 'diff-context', sign: ' ', text: line };
+  }
+
+  function renderDiffCodeBlock(text, parsedLang) {
+    const rawText = String(text || '');
+    const lines = rawText.split(/\r?\n/);
+    const diffLinesHtml = lines.map((rawLine) => {
+      const { className, sign, text: body } = classifyDiffLineForRender(rawLine);
+      return `<span class="diff-line ${className}"><span class="diff-sign">${escapeHtml(sign)}</span><span class="diff-text">${escapeHtml(body)}</span></span>`;
+    }).join('');
+    const langLabel = parsedLang || 'diff';
+
+    return `<div class="code-block-wrapper is-diff">
+      <div class="code-block-header">
+        <span class="code-lang">${escapeHtml(langLabel)}</span>
+        <button class="code-copy-btn" data-action="copy">복사</button>
+      </div>
+      <pre><code class="hljs">${diffLinesHtml}</code></pre>
+    </div>`;
+  }
+
   // 코드 블록: 언어 표시 + 복사 버튼
   renderer.code = function (codeOrToken, maybeLang) {
     const text = typeof codeOrToken === 'string'
@@ -389,7 +462,11 @@
       : String(codeOrToken?.text || '');
     const rawLang = typeof codeOrToken === 'string' ? maybeLang : codeOrToken?.lang;
     const parsedLang = normalizeCodeLanguage(rawLang);
-    const language = (parsedLang === 'diff' || parsedLang === 'patch') ? '' : parsedLang;
+    if (isLikelyDiffCodeBlock(text, parsedLang)) {
+      return renderDiffCodeBlock(text, parsedLang || 'diff');
+    }
+
+    const language = parsedLang;
     const highlighted = renderHighlightedCode(text, language);
     const langLabel = language || 'code';
     const langClass = language ? ` language-${language.replace(/[^a-z0-9_-]/gi, '')}` : '';
