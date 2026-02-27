@@ -2,9 +2,11 @@ const { app, BrowserWindow, ipcMain, screen, dialog, shell } = require('electron
 const path = require('path');
 const os = require('os');
 const fs = require('fs');
+const { spawn, execSync, spawnSync } = require('child_process');
 const pty = require('node-pty');
 
 let mainWindow = null;
+let manualWindow = null;
 const runningProcesses = new Map();
 const processBuffers = new Map(); // id → { ansiFragment: string } — ANSI 분할 방지 버퍼
 let resolvedCliPaths = {}; // command name → resolved absolute path 캐시
@@ -103,6 +105,50 @@ function resolveOpenFileTarget(inputPath) {
     resolvedPath: resolveFilePath(value),
     line,
   };
+}
+
+function runGitCommand(args, cwd) {
+  try {
+    const result = spawnSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      windowsHide: true,
+    });
+    return {
+      ok: result.status === 0,
+      status: Number.isFinite(result.status) ? result.status : 1,
+      stdout: String(result.stdout || ''),
+      stderr: String(result.stderr || ''),
+      error: result.error ? String(result.error.message || result.error) : '',
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      status: 1,
+      stdout: '',
+      stderr: '',
+      error: String(error?.message || error),
+    };
+  }
+}
+
+function normalizeRepoFilePath(inputPath, repoRoot, fallbackCwd) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) return '';
+
+  const { resolvedPath } = resolveOpenFileTarget(raw);
+  let absolutePath = resolvedPath;
+  if (!absolutePath) {
+    const candidate = raw.replace(/^['"]|['"]$/g, '').replace(/^\/([A-Za-z]:[\\/])/, '$1');
+    absolutePath = path.isAbsolute(candidate) ? candidate : path.join(fallbackCwd, candidate);
+  }
+  if (!absolutePath) return '';
+
+  const normalizedAbs = path.normalize(absolutePath);
+  const normalizedRoot = path.normalize(repoRoot);
+  const rel = path.relative(normalizedRoot, normalizedAbs);
+  if (!rel || rel.startsWith('..') || path.isAbsolute(rel)) return '';
+  return rel.replace(/\\/g, '/');
 }
 
 function readTextFilePreview(targetPath) {
@@ -217,13 +263,49 @@ function createWindow() {
   mainWindow.once('ready-to-show', () => mainWindow.show());
 
   mainWindow.on('closed', () => {
-    for (const [id, proc] of runningProcesses) {
-      try { proc.kill(); } catch (e) { /* ignore */ }
+    if (manualWindow && !manualWindow.isDestroyed()) {
+      manualWindow.close();
+    }
+    manualWindow = null;
+    for (const [, handle] of runningProcesses) {
+      try { handle.kill(); } catch (e) { /* ignore */ }
     }
     runningProcesses.clear();
     processBuffers.clear();
     mainWindow = null;
   });
+}
+
+function openManualWindow() {
+  if (manualWindow && !manualWindow.isDestroyed()) {
+    if (manualWindow.isMinimized()) manualWindow.restore();
+    manualWindow.focus();
+    return { success: true };
+  }
+
+  manualWindow = new BrowserWindow({
+    width: 920,
+    height: 760,
+    minWidth: 680,
+    minHeight: 500,
+    parent: mainWindow || undefined,
+    autoHideMenuBar: true,
+    backgroundColor: '#101122',
+    show: false,
+    webPreferences: {
+      contextIsolation: true,
+      nodeIntegration: false,
+      sandbox: true,
+    },
+  });
+
+  manualWindow.loadFile(path.join(__dirname, 'renderer', 'manual.html'));
+  manualWindow.once('ready-to-show', () => manualWindow?.show());
+  manualWindow.on('closed', () => {
+    manualWindow = null;
+  });
+
+  return { success: true };
 }
 
 // --- CLI 경로 자동 탐색 ---
@@ -248,7 +330,6 @@ function resolveCliPath(command) {
 
   // 1. npm global 경로 (npm prefix -g)
   try {
-    const { execSync } = require('child_process');
     const npmGlobal = execSync('npm prefix -g', { encoding: 'utf8', timeout: 5000 }).trim();
     if (npmGlobal) {
       for (const ext of extensions) {
@@ -317,6 +398,58 @@ function resolveCliPath(command) {
   return isWin ? `${command}.cmd` : command;
 }
 
+function createProcessHandle(kind, proc) {
+  if (kind === 'spawn') {
+    return {
+      kind,
+      proc,
+      write(data) {
+        if (!proc || !proc.stdin || proc.stdin.destroyed) return;
+        try { proc.stdin.write(String(data || '')); } catch { /* ignore */ }
+      },
+      kill() {
+        if (!proc) return;
+        try {
+          if (proc.stdin && !proc.stdin.destroyed) proc.stdin.end();
+        } catch { /* ignore */ }
+        try { proc.kill(); } catch { /* ignore */ }
+      },
+    };
+  }
+
+  return {
+    kind: 'pty',
+    proc,
+    write(data) {
+      if (!proc) return;
+      try { proc.write(String(data || '')); } catch { /* ignore */ }
+    },
+    kill() {
+      if (!proc) return;
+      try { proc.kill(); } catch { /* ignore */ }
+    },
+  };
+}
+
+function resolveCodexDirectInvocation(commandName, resolvedShell) {
+  const command = String(commandName || '').trim().toLowerCase();
+  if (command !== 'codex') return null;
+
+  const shellPath = String(resolvedShell || '').trim();
+  if (!shellPath) return null;
+
+  const baseDir = path.dirname(shellPath);
+  const codexJsPath = path.join(baseDir, 'node_modules', '@openai', 'codex', 'bin', 'codex.js');
+  if (!fs.existsSync(codexJsPath)) return null;
+
+  const localNodeExe = path.join(baseDir, 'node.exe');
+  const nodeCommand = fs.existsSync(localNodeExe) ? localNodeExe : 'node';
+  return {
+    command: nodeCommand,
+    argsPrefix: [codexJsPath],
+  };
+}
+
 // --- CLI 실행 (node-pty 기반 PTY) ---
 ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
   const shell = profile.command;
@@ -325,6 +458,9 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
     ? [...(profile.args || []), '--', promptText]
     : [...(profile.args || [])];
   const runCwd = cwd || workingDirectory;
+  const isJsonMode = args.some((arg) => String(arg).trim().toLowerCase() === '--json');
+  const forceSpawnMode = process.platform === 'win32' && String(shell || '').toLowerCase() === 'codex';
+  const useSpawnMode = isJsonMode || forceSpawnMode;
 
   console.log(`[CLI] run id=${id} shell=${shell} args=${JSON.stringify(args)} cwd=${runCwd}`);
 
@@ -335,53 +471,130 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
 
     // CLI 경로 자동 탐색 (npm global, PATH 등)
     const resolvedShell = resolveCliPath(shell);
-    const proc = pty.spawn(resolvedShell, args, {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 30,
-      cwd: runCwd,
-      env,
-    });
 
-    runningProcesses.set(id, proc);
-    processBuffers.set(id, { ansiFragment: '' });
+    if (useSpawnMode) {
+      // JSONL 출력은 PTY 대신 pipe 기반 spawn으로 받아 줄바꿈/폭 래핑 손상을 방지한다.
+      const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(resolvedShell);
+      let spawnCommand = resolvedShell;
+      let spawnArgs = args;
+      const spawnOptions = {
+        cwd: runCwd,
+        env,
+        windowsHide: true,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      };
 
-    proc.onData((data) => {
-      const buf = processBuffers.get(id);
-      if (!buf) return;
-
-      // node-pty(Windows)는 이미 디코딩된 문자열을 전달 → 문자열 기반 처리
-      // 이전 미완성 ANSI 시퀀스와 결합
-      const textWithPrev = buf.ansiFragment + data;
-      const { clean: safeText, fragment } = splitAnsiSafe(textWithPrev);
-      buf.ansiFragment = fragment;
-
-      if (!safeText) return;
-
-      const clean = stripAnsi(safeText);
-      if (clean && mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
-      }
-    });
-
-    proc.onExit(({ exitCode }) => {
-      console.log(`[CLI] exit id=${id} code=${exitCode}`);
-
-      // 잔여 ANSI 프래그먼트 플러시
-      const buf = processBuffers.get(id);
-      if (buf && buf.ansiFragment && mainWindow && !mainWindow.isDestroyed()) {
-        const clean = stripAnsi(buf.ansiFragment);
-        if (clean) {
-          mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+      const directCodexInvocation = resolveCodexDirectInvocation(shell, resolvedShell);
+      if (directCodexInvocation) {
+        spawnCommand = directCodexInvocation.command;
+        spawnArgs = [...directCodexInvocation.argsPrefix, ...args];
+      } else if (isWindowsCmdShim) {
+        const ps1Path = resolvedShell.replace(/\.cmd$/i, '.ps1');
+        if (fs.existsSync(ps1Path)) {
+          // npm 전역 codex.cmd shim은 shell 경유 시 인자 쪼개짐이 발생할 수 있어 ps1 직접 실행
+          const powerShellExe = path.join(
+            process.env.SystemRoot || 'C:\\Windows',
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe'
+          );
+          spawnCommand = powerShellExe;
+          spawnArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path, ...args];
+        } else {
+          // ps1 shim이 없으면 기존 방식으로 폴백
+          spawnOptions.shell = true;
         }
       }
-      processBuffers.delete(id);
-      runningProcesses.delete(id);
 
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('cli:done', { id, code: exitCode });
-      }
-    });
+      const child = spawn(spawnCommand, spawnArgs, spawnOptions);
+
+      runningProcesses.set(id, createProcessHandle('spawn', child));
+
+      child.stdout?.on('data', (data) => {
+        const text = typeof data === 'string' ? data : data.toString('utf8');
+        if (!text || !mainWindow || mainWindow.isDestroyed()) return;
+        const chunk = isJsonMode ? text : stripAnsi(text);
+        if (!chunk) return;
+        mainWindow.webContents.send('cli:stream', { id, chunk, type: 'stdout' });
+      });
+
+      child.stderr?.on('data', (data) => {
+        const text = typeof data === 'string' ? data : data.toString('utf8');
+        if (!text || !mainWindow || mainWindow.isDestroyed()) return;
+        const chunk = isJsonMode ? text : stripAnsi(text);
+        if (!chunk) return;
+        mainWindow.webContents.send('cli:stream', { id, chunk, type: 'stderr' });
+      });
+
+      child.on('error', (err) => {
+        console.log(`[CLI] error id=${id} err=${err.message}`);
+        runningProcesses.delete(id);
+        processBuffers.delete(id);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('cli:error', { id, error: err.message });
+        }
+      });
+
+      child.on('close', (code) => {
+        const exitCode = Number.isFinite(code) ? code : 0;
+        console.log(`[CLI] exit id=${id} code=${exitCode}`);
+        runningProcesses.delete(id);
+        processBuffers.delete(id);
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('cli:done', { id, code: exitCode });
+        }
+      });
+    } else {
+      const proc = pty.spawn(resolvedShell, args, {
+        name: 'xterm-256color',
+        cols: 120,
+        rows: 30,
+        cwd: runCwd,
+        env,
+      });
+
+      runningProcesses.set(id, createProcessHandle('pty', proc));
+      processBuffers.set(id, { ansiFragment: '' });
+
+      proc.onData((data) => {
+        const buf = processBuffers.get(id);
+        if (!buf) return;
+
+        // node-pty(Windows)는 이미 디코딩된 문자열을 전달 → 문자열 기반 처리
+        // 이전 미완성 ANSI 시퀀스와 결합
+        const textWithPrev = buf.ansiFragment + data;
+        const { clean: safeText, fragment } = splitAnsiSafe(textWithPrev);
+        buf.ansiFragment = fragment;
+
+        if (!safeText) return;
+
+        const clean = stripAnsi(safeText);
+        if (clean && mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+        }
+      });
+
+      proc.onExit(({ exitCode }) => {
+        console.log(`[CLI] exit id=${id} code=${exitCode}`);
+
+        // 잔여 ANSI 프래그먼트 플러시
+        const buf = processBuffers.get(id);
+        if (buf && buf.ansiFragment && mainWindow && !mainWindow.isDestroyed()) {
+          const clean = stripAnsi(buf.ansiFragment);
+          if (clean) {
+            mainWindow.webContents.send('cli:stream', { id, chunk: clean, type: 'stdout' });
+          }
+        }
+        processBuffers.delete(id);
+        runningProcesses.delete(id);
+
+        if (mainWindow && !mainWindow.isDestroyed()) {
+          mainWindow.webContents.send('cli:done', { id, code: exitCode });
+        }
+      });
+    }
 
     // 즉시 반환 - 스트리밍은 이벤트로 처리
     return { success: true, id };
@@ -394,9 +607,9 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
 
 // CLI 프로세스에 입력 전송
 ipcMain.handle('cli:write', (event, { id, data }) => {
-  const proc = runningProcesses.get(id);
-  if (proc) {
-    proc.write(data);
+  const handle = runningProcesses.get(id);
+  if (handle) {
+    handle.write(data);
     return { success: true };
   }
   return { success: false };
@@ -404,11 +617,11 @@ ipcMain.handle('cli:write', (event, { id, data }) => {
 
 // CLI 프로세스 중지
 ipcMain.handle('cli:stop', (event, { id }) => {
-  const proc = runningProcesses.get(id);
-  if (proc) {
+  const handle = runningProcesses.get(id);
+  if (handle) {
     try {
-      proc.write('\x03'); // Ctrl+C 시그널
-      proc.kill();
+      handle.write('\x03'); // Ctrl+C 시그널
+      handle.kill();
     } catch (e) { /* ignore */ }
     processBuffers.delete(id);
     runningProcesses.delete(id);
@@ -489,6 +702,80 @@ ipcMain.handle('file:open', async (event, { filePath }) => {
   }
 });
 
+ipcMain.handle('repo:getFileDiffs', (event, arg) => {
+  try {
+    const requestedCwd = typeof arg?.cwd === 'string' && arg.cwd.trim()
+      ? arg.cwd.trim()
+      : workingDirectory;
+    const files = Array.isArray(arg?.files) ? arg.files : [];
+    if (files.length === 0) return { success: true, data: [] };
+
+    const cwd = fs.existsSync(requestedCwd) ? requestedCwd : workingDirectory;
+    const rootResult = runGitCommand(['rev-parse', '--show-toplevel'], cwd);
+    if (!rootResult.ok) {
+      return { success: false, error: 'git repository not found', data: [] };
+    }
+    const repoRoot = rootResult.stdout.trim();
+    if (!repoRoot) {
+      return { success: false, error: 'git repository root not resolved', data: [] };
+    }
+
+    const normalizedFiles = [];
+    const seen = new Set();
+    for (const file of files) {
+      const rel = normalizeRepoFilePath(file, repoRoot, cwd);
+      if (!rel || seen.has(rel)) continue;
+      seen.add(rel);
+      normalizedFiles.push(rel);
+      if (normalizedFiles.length >= 24) break;
+    }
+
+    const data = [];
+    for (const rel of normalizedFiles) {
+      const staged = runGitCommand(['diff', '--no-color', '--cached', '--', rel], repoRoot);
+      const unstaged = runGitCommand(['diff', '--no-color', '--', rel], repoRoot);
+      let diffText = '';
+      if (staged.ok && staged.stdout.trim()) diffText += `${staged.stdout.trim()}\n`;
+      if (unstaged.ok && unstaged.stdout.trim()) diffText += `${unstaged.stdout.trim()}\n`;
+
+      if (!diffText.trim()) {
+        const untracked = runGitCommand(['ls-files', '--others', '--exclude-standard', '--', rel], repoRoot);
+        const isUntracked = untracked.ok && untracked.stdout
+          .split(/\r?\n/)
+          .map(line => line.trim().replace(/\\/g, '/'))
+          .some(line => line === rel);
+        if (isUntracked) {
+          const abs = path.join(repoRoot, rel);
+          if (fs.existsSync(abs) && fs.statSync(abs).isFile()) {
+            const content = fs.readFileSync(abs, 'utf8');
+            const limited = content.length > 10000 ? `${content.slice(0, 10000)}\n...` : content;
+            const bodyLines = limited.split(/\r?\n/);
+            const plusLines = bodyLines.map(line => `+${line}`).join('\n');
+            diffText = [
+              `diff --git a/${rel} b/${rel}`,
+              'new file mode 100644',
+              '--- /dev/null',
+              `+++ b/${rel}`,
+              `@@ -0,0 +1,${bodyLines.length} @@`,
+              plusLines,
+            ].join('\n');
+          }
+        }
+      }
+
+      const trimmed = diffText.trim();
+      if (!trimmed) continue;
+      const safeDiff = trimmed.length > 160000 ? `${trimmed.slice(0, 160000)}\n...` : trimmed;
+      data.push({ file: rel, diff: safeDiff });
+      if (data.length >= 12) break;
+    }
+
+    return { success: true, data };
+  } catch (error) {
+    return { success: false, error: error.message || 'diff collection failed', data: [] };
+  }
+});
+
 // 윈도우 컨트롤
 ipcMain.on('window:minimize', () => mainWindow?.minimize());
 ipcMain.on('window:maximize', () => {
@@ -498,6 +785,13 @@ ipcMain.on('window:maximize', () => {
 });
 ipcMain.on('window:close', () => mainWindow?.close());
 ipcMain.handle('window:isMaximized', () => mainWindow?.isMaximized() ?? false);
+ipcMain.handle('help:openManual', () => {
+  try {
+    return openManualWindow();
+  } catch (error) {
+    return { success: false, error: error.message || '사용 설명서를 열지 못했습니다.' };
+  }
+});
 
 // --- Codex rate_limits 읽기 (세션 JSONL에서) ---
 ipcMain.handle('codex:rateLimits', () => {
@@ -895,6 +1189,8 @@ ipcMain.handle('system:info', () => ({
   platform: process.platform,
   username: os.userInfo().username,
   homedir: os.homedir(),
+  appVersion: app.getVersion(),
+  electronVersion: process.versions.electron,
 }));
 
 // --- 대화 데이터 파일 기반 저장/로드 ---

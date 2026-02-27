@@ -32,6 +32,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
     read: (filePath) => ipcRenderer.invoke('file:read', { filePath }),
     open: (filePath) => ipcRenderer.invoke('file:open', { filePath }),
   },
+  repo: {
+    getFileDiffs: (arg) => ipcRenderer.invoke('repo:getFileDiffs', arg),
+  },
   window: {
     minimize: () => ipcRenderer.send('window:minimize'),
     maximize: () => ipcRenderer.send('window:maximize'),
@@ -42,6 +45,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
       ipcRenderer.on('window:maximized', handler);
       return () => ipcRenderer.removeListener('window:maximized', handler);
     },
+  },
+  help: {
+    openManual: () => ipcRenderer.invoke('help:openManual'),
   },
   codex: {
     rateLimits: () => ipcRenderer.invoke('codex:rateLimits'),

@@ -374,7 +374,46 @@ body.sidebar-resizing * {
   color: var(--red);
 }
 
-#sidebar-bottom { padding: 12px; border-top: 1px solid var(--border); }
+#sidebar-bottom {
+  padding: 12px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.sidebar-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 22px;
+}
+
+.sidebar-link-btn {
+  border: none;
+  background: transparent;
+  color: var(--text-secondary);
+  font-family: var(--font);
+  font-size: 11.5px;
+  cursor: pointer;
+  padding: 2px 0;
+  text-align: left;
+  transition: color var(--transition);
+}
+
+.sidebar-link-btn:hover {
+  color: var(--accent);
+}
+
+.sidebar-version {
+  margin-left: auto;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 10.5px;
+  white-space: nowrap;
+  opacity: 0.9;
+}
 
 /* === 채팅 영역 === */
 #chat-area {
@@ -598,6 +637,65 @@ body.sidebar-resizing * {
   color: #a2aac0;
 }
 
+.stream-inline-progress {
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  background: #131322;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  border-left: 1px solid var(--border-light);
+}
+
+.stream-inline-progress-title {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 6px;
+  letter-spacing: 0.2px;
+}
+
+.stream-inline-progress-lines {
+  --stream-inline-visible-lines: 5;
+  font-family: 'Cascadia Code', 'Consolas', monospace;
+  font-size: 11.5px;
+  line-height: 1.45;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-height: calc((var(--stream-inline-visible-lines) * 1.45em) + ((var(--stream-inline-visible-lines) - 1) * 2px));
+  max-height: calc((var(--stream-inline-visible-lines) * 1.45em) + ((var(--stream-inline-visible-lines) - 1) * 2px));
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-light) transparent;
+}
+
+.stream-inline-line {
+  color: #8e96ad;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  word-break: break-word;
+}
+
+.stream-inline-line.is-placeholder {
+  opacity: 0.35;
+}
+
+.stream-inline-line:last-child {
+  color: #a2aac0;
+}
+
+.streaming-answer-body {
+  margin-top: 6px;
+}
+
+.streaming-answer-placeholder {
+  color: var(--text-muted);
+  font-size: 13px;
+  font-style: italic;
+}
+
 /* === Codex 탭 UI === */
 .msg-tabs {
   display: flex;
@@ -633,7 +731,31 @@ body.sidebar-resizing * {
   animation: none;
 }
 
+.msg-tab-content[data-tab-content="process"] {
+  max-height: min(68vh, 760px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+  scrollbar-gutter: stable;
+}
+
+.msg-tab-content[data-tab-content="code"] {
+  max-height: min(68vh, 760px);
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 6px;
+  scrollbar-gutter: stable;
+}
+
 .process-brief {
+  padding: 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-surface);
+  overflow: visible;
+}
+
+.code-brief {
   padding: 12px;
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -666,18 +788,49 @@ body.sidebar-resizing * {
   flex-direction: column;
   gap: 8px;
   margin: 0;
-  max-height: 300px;
-  overflow-y: auto;
+  max-height: none;
+  overflow: visible;
   padding-right: 2px;
 }
 
 .process-item {
-  display: flex;
-  gap: 10px;
-  padding: 9px 10px;
+  display: block;
   border: 1px solid var(--border);
   border-radius: 8px;
   background: #202039;
+  overflow: hidden;
+}
+
+.process-item-summary {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 9px 10px;
+  cursor: pointer;
+  list-style: none;
+}
+
+.process-item-summary::-webkit-details-marker {
+  display: none;
+}
+
+.process-item-summary::before {
+  content: '\25B6';
+  width: 10px;
+  color: var(--text-muted);
+  font-size: 9px;
+  line-height: 1.9;
+  transition: transform 180ms ease;
+  flex-shrink: 0;
+}
+
+.process-item[open] .process-item-summary::before {
+  transform: rotate(90deg);
+}
+
+.process-summary-main {
+  min-width: 0;
+  flex: 1;
 }
 
 .process-index {
@@ -692,13 +845,15 @@ body.sidebar-resizing * {
 
 .process-content {
   min-width: 0;
+  padding: 0 12px 10px 46px;
+  border-top: 1px solid rgba(255, 255, 255, 0.05);
 }
 
 .process-kind {
   font-size: 12px;
   font-weight: 600;
   color: var(--text);
-  margin-bottom: 2px;
+  margin-bottom: 3px;
 }
 
 .process-detail {
@@ -708,7 +863,7 @@ body.sidebar-resizing * {
 }
 
 .process-extra-title {
-  margin-top: 6px;
+  margin-top: 8px;
   font-size: 10.5px;
   color: var(--text-muted);
   letter-spacing: 0.35px;
@@ -718,6 +873,36 @@ body.sidebar-resizing * {
 .process-extra {
   margin: 4px 0 0;
   padding-left: 18px;
+}
+
+.process-extra-scroll {
+  max-height: 320px;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 2px;
+  scrollbar-gutter: stable;
+}
+
+.msg-tab-content[data-tab-content="process"]::-webkit-scrollbar,
+.msg-tab-content[data-tab-content="code"]::-webkit-scrollbar,
+.process-extra-scroll::-webkit-scrollbar,
+.stream-inline-progress-lines::-webkit-scrollbar {
+  width: 8px;
+}
+
+.msg-tab-content[data-tab-content="process"]::-webkit-scrollbar-track,
+.msg-tab-content[data-tab-content="code"]::-webkit-scrollbar-track,
+.process-extra-scroll::-webkit-scrollbar-track,
+.stream-inline-progress-lines::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.msg-tab-content[data-tab-content="process"]::-webkit-scrollbar-thumb,
+.msg-tab-content[data-tab-content="code"]::-webkit-scrollbar-thumb,
+.process-extra-scroll::-webkit-scrollbar-thumb,
+.stream-inline-progress-lines::-webkit-scrollbar-thumb {
+  background: var(--border-light);
+  border-radius: 6px;
 }
 
 .process-extra li {
@@ -1164,7 +1349,9 @@ body.sidebar-resizing * {
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line {
-  display: block;
+  display: grid;
+  grid-template-columns: 1.3em minmax(0, 1fr);
+  column-gap: 0.2em;
   padding: 1px 16px 1px 12px;
   min-height: 1.55em;
   font-family: var(--mono);
@@ -1174,11 +1361,17 @@ body.sidebar-resizing * {
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line .diff-sign {
-  display: inline-block;
-  width: 1.2em;
+  display: block;
   text-align: center;
   font-weight: 700;
   user-select: none;
+  white-space: pre;
+}
+
+.msg-body .code-block-wrapper.is-diff .diff-line .diff-text {
+  display: block;
+  white-space: pre;
+  min-width: max-content;
 }
 
 .msg-body .code-block-wrapper.is-diff .diff-line.diff-context {
@@ -1226,6 +1419,14 @@ body.sidebar-resizing * {
   padding: 6px 16px 6px 12px;
   margin-top: 4px;
   border-top: 1px solid rgba(255,255,255,0.06);
+}
+
+.msg-body .code-block-wrapper.is-diff .diff-line.diff-file-header .diff-sign {
+  display: none;
+}
+
+.msg-body .code-block-wrapper.is-diff .diff-line.diff-file-header .diff-text {
+  grid-column: 1 / -1;
 }
 
 /* 테이블 */

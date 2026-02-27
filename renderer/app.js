@@ -20,13 +20,25 @@
       const messagesRaw = Array.isArray(item.messages) ? item.messages : [];
       const messages = messagesRaw
         .filter(msg => msg && typeof msg === 'object')
-        .map(msg => ({
-          id: typeof msg.id === 'string' && msg.id ? msg.id : `msg_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
-          role: msg.role === 'user' || msg.role === 'error' ? msg.role : 'ai',
-          content: typeof msg.content === 'string' ? msg.content : '',
-          profileId: 'codex',
-          timestamp: Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now(),
-        }));
+        .map(msg => {
+          const actualCodeDiffs = Array.isArray(msg.actualCodeDiffs)
+            ? msg.actualCodeDiffs
+              .map(item => ({
+                file: typeof item?.file === 'string' ? item.file : '',
+                diff: typeof item?.diff === 'string' ? item.diff : '',
+              }))
+              .filter(item => item.file && item.diff)
+              .slice(0, 12)
+            : [];
+          return {
+            id: typeof msg.id === 'string' && msg.id ? msg.id : `msg_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+            role: msg.role === 'user' || msg.role === 'error' ? msg.role : 'ai',
+            content: typeof msg.content === 'string' ? msg.content : '',
+            profileId: 'codex',
+            timestamp: Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now(),
+            actualCodeDiffs,
+          };
+        });
       const cwd = typeof item.cwd === 'string' ? item.cwd : '';
       const codexSessionId = typeof item.codexSessionId === 'string' ? item.codexSessionId : null;
       normalized.push({ id, title, messages, profileId, cwd, codexSessionId });
@@ -167,8 +179,11 @@
     const right = String(rightPart || '');
     if (!right) return left;
 
-    const leftTail = /([A-Za-z0-9_.$%/+\\:-]+)$/.exec(left)?.[1] || '';
-    const rightHead = /^([A-Za-z0-9_.$%/+\\:-]+)/.exec(right)?.[1] || '';
+    // 전체 문자열 스캔을 피하기 위해 경계 구간만 검사
+    const leftTailSource = left.slice(-96);
+    const rightHeadSource = right.slice(0, 96);
+    const leftTail = /([A-Za-z0-9_.$%/+\\:\-가-힣]+)$/.exec(leftTailSource)?.[1] || '';
+    const rightHead = /^([A-Za-z0-9_.$%/+\\:\-가-힣]+)/.exec(rightHeadSource)?.[1] || '';
     let overlap = 0;
     if (leftTail && rightHead) {
       const maxOverlap = Math.min(leftTail.length, rightHead.length, 48);
@@ -183,6 +198,36 @@
     const adjustedRight = overlap > 0 ? right.slice(overlap) : right;
     if (!adjustedRight) return left;
     return `${left}${adjustedRight}`;
+  }
+
+  // 스트리밍 chunk 경계에서 중복된 접두/접미를 제거해 문장/코드 분리 오동작을 줄인다.
+  function appendStreamingChunk(accumulatedText, incomingChunk) {
+    const base = String(accumulatedText || '');
+    let chunk = String(incomingChunk || '');
+    if (!chunk) return base;
+    if (!base) return chunk;
+
+    // 대형 출력에서는 병합 보정 연산을 생략해 UI 멈춤을 방지
+    if (base.length > 200000 || chunk.length > 8192) {
+      return `${base}${chunk}`;
+    }
+
+    if (base.endsWith(chunk)) return base;
+
+    // transport 재전송으로 큰 접두 중복이 붙는 경우 우선 제거
+    const maxExact = Math.min(base.length, chunk.length, 256);
+    let exactOverlap = 0;
+    for (let k = maxExact; k >= 8; k--) {
+      if (base.slice(-k) === chunk.slice(0, k)) {
+        exactOverlap = k;
+        break;
+      }
+    }
+    if (exactOverlap > 0) {
+      chunk = chunk.slice(exactOverlap);
+      if (!chunk) return base;
+    }
+    return `${base}${chunk}`;
   }
 
   // 마크다운 링크 URL이 줄바꿈으로 끊긴 경우 한 줄로 복원
@@ -268,56 +313,6 @@
     return { path: value, line };
   }
 
-  function classifyDiffLine(line) {
-    if (/^\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File)/i.test(line)) return 'diff-meta';
-    if (/^(diff --git|index\s+\S+|---\s|\+\+\+\s|@@\s|\\\sNo newline)/.test(line)) return 'diff-meta';
-    if (/^\+/.test(line)) return 'diff-add';
-    if (/^-/.test(line)) return 'diff-del';
-    return 'diff-context';
-  }
-
-  function isLikelyDiffBlock(text, language) {
-    if (language === 'diff' || language === 'patch') return true;
-    const lines = String(text || '').split(/\r?\n/).filter(line => line.trim() !== '');
-    if (lines.length === 0) return false;
-    let plusCount = 0;
-    let minusCount = 0;
-    let markerCount = 0;
-    for (const line of lines) {
-      if (/^\+/.test(line)) plusCount += 1;
-      if (/^-/.test(line)) minusCount += 1;
-      if (/^(@@|diff --git|index\s+\S+|---\s|\+\+\+\s|\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File))/i.test(line)) {
-        markerCount += 1;
-      }
-    }
-    const changed = plusCount + minusCount;
-    return markerCount > 0 && changed >= 2;
-  }
-
-  function renderDiffHtml(text) {
-    return String(text || '')
-      .replace(/\r\n/g, '\n')
-      .split('\n')
-      .map((line) => {
-        const cls = classifyDiffLine(line);
-        const safeLine = escapeHtml(line);
-
-        // +/- 부호를 별도 span으로 분리
-        if (cls === 'diff-add' && line.startsWith('+')) {
-          return `<span class="diff-line ${cls}"><span class="diff-sign">+</span>${escapeHtml(line.slice(1))}</span>`;
-        }
-        if (cls === 'diff-del' && line.startsWith('-')) {
-          // "--- Update/Add/Delete:" 파일 헤더 구분
-          if (/^---\s+(Update|Add|Delete|Move):/i.test(line)) {
-            return `<span class="diff-line diff-file-header">${safeLine}</span>`;
-          }
-          return `<span class="diff-line ${cls}"><span class="diff-sign">-</span>${escapeHtml(line.slice(1))}</span>`;
-        }
-        return `<span class="diff-line ${cls}">${safeLine}</span>`;
-      })
-      .join('\n');
-  }
-
   function renderHighlightedCode(text, language) {
     if (!hljsApi) return escapeHtml(text);
     try {
@@ -329,19 +324,18 @@
     }
   }
 
-  // 코드 블록: 언어 표시 + 복사 버튼 + diff 색상
+  // 코드 블록: 언어 표시 + 복사 버튼
   renderer.code = function (codeOrToken, maybeLang) {
     const text = typeof codeOrToken === 'string'
       ? codeOrToken
       : String(codeOrToken?.text || '');
     const rawLang = typeof codeOrToken === 'string' ? maybeLang : codeOrToken?.lang;
     const parsedLang = normalizeCodeLanguage(rawLang);
-    const isDiff = isLikelyDiffBlock(text, parsedLang);
-    const language = isDiff ? 'diff' : parsedLang;
-    const highlighted = isDiff ? renderDiffHtml(text) : renderHighlightedCode(text, language);
+    const language = (parsedLang === 'diff' || parsedLang === 'patch') ? '' : parsedLang;
+    const highlighted = renderHighlightedCode(text, language);
     const langLabel = language || 'code';
     const langClass = language ? ` language-${language.replace(/[^a-z0-9_-]/gi, '')}` : '';
-    return `<div class="code-block-wrapper${isDiff ? ' is-diff' : ''}">
+    return `<div class="code-block-wrapper">
       <div class="code-block-header">
         <span class="code-lang">${escapeHtml(langLabel)}</span>
         <button class="code-copy-btn" data-action="copy">복사</button>
@@ -381,7 +375,7 @@
   marked.setOptions({
     renderer,
     gfm: true,
-    breaks: false,
+    breaks: true,
   });
 
   // === 프로필 ===
@@ -402,6 +396,8 @@
   const convStreams = new Map();
 
   const MESSAGE_SCROLL_BOTTOM_THRESHOLD = 20;
+  const STREAM_INLINE_PROGRESS_VISIBLE_LINES = 5;
+  const STREAM_INLINE_PROGRESS_HISTORY_LIMIT = 300;
   let shouldAutoScrollMessages = true;
   let suppressMessagesScrollEvent = false;
   let historyEditingId = null;
@@ -436,6 +432,8 @@
   const $sessionPicker = document.getElementById('session-picker');
   const $slashFeedback = document.getElementById('slash-command-feedback');
   const $codexStatusbar = document.getElementById('codex-statusbar');
+  const $appVersion = document.getElementById('app-version');
+  const $btnUserManual = document.getElementById('btn-user-manual');
 
   const SLASH_COMMANDS = [
     // --- Codex 실행 ---
@@ -485,7 +483,10 @@
   const REASONING_OPTIONS = ['low', 'medium', 'high', 'extra high'];
   const DEFAULT_MODEL_ID = 'GPT-5.3-Codex';
   const DEFAULT_REASONING = 'extra high';
-  const RUNTIME_INFO_VERSION = 2;
+  const RUNTIME_INFO_VERSION = 3;
+  const STREAM_RENDER_THROTTLE_MS = 70;
+  const STREAM_SECTIONS_PARSE_INTERVAL_MS = 280;
+  const SHOW_STREAMING_WORK_PANEL = false;
 
   let slashMenuItems = [];
   let slashSelectedIndex = 0;
@@ -1047,14 +1048,13 @@
   function loadCodexRuntimeInfo() {
     try {
       const saved = JSON.parse(localStorage.getItem('codexRuntimeInfo') || '{}');
-      if (Number(saved.version) !== RUNTIME_INFO_VERSION) {
-        return { model: DEFAULT_MODEL_ID, reasoning: DEFAULT_REASONING };
-      }
       const savedModelId = normalizeModelOptionId(saved.model);
       const savedReasoning = normalizeReasoning(saved.reasoning);
+      const hasSavedModel = typeof saved.model === 'string' && saved.model.trim().length > 0;
+      const hasSavedReasoning = typeof saved.reasoning === 'string' && saved.reasoning.trim().length > 0;
       return {
-        model: MODEL_OPTION_IDS.includes(savedModelId) ? savedModelId : DEFAULT_MODEL_ID,
-        reasoning: REASONING_OPTIONS.includes(savedReasoning) ? savedReasoning : DEFAULT_REASONING,
+        model: hasSavedModel && MODEL_OPTION_IDS.includes(savedModelId) ? savedModelId : DEFAULT_MODEL_ID,
+        reasoning: hasSavedReasoning && REASONING_OPTIONS.includes(savedReasoning) ? savedReasoning : DEFAULT_REASONING,
       };
     } catch {
       return { model: DEFAULT_MODEL_ID, reasoning: DEFAULT_REASONING };
@@ -1153,6 +1153,66 @@
     return m ? m[1] : null;
   }
 
+  function extractCodexSessionIdFromText(text) {
+    const source = String(text || '');
+    const plain = source.match(/session\s*id\s*:\s*(\S+)/i);
+    if (plain) return plain[1];
+    const thread = source.match(/"thread_id"\s*:\s*"([0-9a-f-]{16,})"/i);
+    if (thread) return thread[1];
+    const sessionMeta = source.match(/"type"\s*:\s*"session_meta"[\s\S]{0,400}?"id"\s*:\s*"([0-9a-f-]{16,})"/i);
+    if (sessionMeta) return sessionMeta[1];
+    return null;
+  }
+
+  function createThrottledInvoker(intervalMs, fn) {
+    const minInterval = Math.max(16, Number(intervalMs) || 70);
+    let timer = null;
+    let lastRunAt = 0;
+    let pending = false;
+
+    const invoke = () => {
+      timer = null;
+      if (!pending) return;
+      pending = false;
+      lastRunAt = Date.now();
+      try {
+        fn();
+      } catch (err) {
+        console.error('[throttle-invoke]', err);
+      }
+    };
+
+    const schedule = () => {
+      pending = true;
+      if (timer) return;
+      const elapsed = Date.now() - lastRunAt;
+      if (elapsed >= minInterval) {
+        invoke();
+        return;
+      }
+      timer = setTimeout(invoke, minInterval - elapsed);
+    };
+
+    schedule.flush = () => {
+      if (!pending) return;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      invoke();
+    };
+
+    schedule.cancel = () => {
+      pending = false;
+      if (timer) {
+        clearTimeout(timer);
+        timer = null;
+      }
+    };
+
+    return schedule;
+  }
+
   function buildCodexArgs(sessionId) {
     const args = ['exec'];
     if (sessionId) {
@@ -1167,9 +1227,12 @@
     } else {
       args.push('--full-auto');
     }
+    args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
     const effort = normalizeReasoning(codexRuntimeInfo.reasoning);
-    if (effort && effort !== 'extra high') {
+    if (effort === 'extra high') {
+      args.push('-c', 'model_reasoning_effort=xhigh');
+    } else if (effort === 'low' || effort === 'medium' || effort === 'high') {
       args.push('-c', `model_reasoning_effort=${effort}`);
     } else {
       args.push('-c', 'model_reasoning_effort=xhigh');
@@ -1178,7 +1241,24 @@
   }
 
   function buildCodexPrompt(promptText) {
-    return String(promptText || '');
+    const userPrompt = String(promptText || '').trim();
+    const diffPolicy = [
+      '',
+      '[응답 형식 규칙]',
+      '파일을 수정/추가/삭제했다면, 최종 답변 끝에 반드시 "변경 Diff" 섹션을 추가하세요.',
+      '해당 섹션에는 unified diff 형식 코드블록만 포함하세요.',
+      '예시 형식:',
+      '```diff',
+      'diff --git a/path/to/file b/path/to/file',
+      '--- a/path/to/file',
+      '+++ b/path/to/file',
+      '@@ -old,+new @@',
+      '-old line',
+      '+new line',
+      '```',
+      '파일 변경이 없으면 "변경 Diff" 섹션을 추가하지 마세요.',
+    ].join('\n');
+    return `${userPrompt}\n${diffPolicy}`.trim();
   }
 
   function stripWrappingQuotes(text) {
@@ -2049,14 +2129,45 @@
     });
   }
 
+  function runInitStep(name, fn) {
+    try {
+      const out = typeof fn === 'function' ? fn() : null;
+      if (out && typeof out.then === 'function') {
+        out.catch((err) => {
+          try { console.error(`[init:${name}]`, err); } catch { /* ignore */ }
+        });
+      }
+      return out;
+    } catch (err) {
+      try { console.error(`[init:${name}]`, err); } catch { /* ignore */ }
+      return null;
+    }
+  }
+
+  async function initSidebarMeta() {
+    if ($appVersion) {
+      $appVersion.textContent = '버전 확인 중...';
+    }
+    try {
+      const info = await window.electronAPI.system.info();
+      const appVersion = String(info?.appVersion || '').trim();
+      if ($appVersion) {
+        $appVersion.textContent = appVersion ? `v${appVersion}` : 'v-';
+      }
+    } catch {
+      if ($appVersion) $appVersion.textContent = 'v-';
+    }
+  }
+
   // === 초기화 ===
-  initSidebarLayout();
-  initCwd();
-  renderProfiles();
-  renderHistory();
-  setActiveProfile(activeProfileId);
-  updateCodexStatusbar();
-  void refreshCodexRateLimits('init');
+  runInitStep('sidebar-layout', () => initSidebarLayout());
+  runInitStep('sidebar-meta', () => initSidebarMeta());
+  runInitStep('cwd', () => initCwd());
+  runInitStep('profiles', () => renderProfiles());
+  runInitStep('history', () => renderHistory());
+  runInitStep('active-profile', () => setActiveProfile(activeProfileId));
+  runInitStep('statusbar', () => updateCodexStatusbar());
+  runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
 
   if ($modelHint) {
     $modelHint.addEventListener('click', (e) => {
@@ -2084,7 +2195,7 @@
 
   // 새 대화 시작 (또는 마지막 대화 복원)
   if (conversations.length > 0) {
-    loadConversation(conversations[0].id);
+    runInitStep('restore-conversation', () => loadConversation(conversations[0].id));
   }
 
   // === 작업 폴더 ===
@@ -2355,20 +2466,30 @@
   }
 
   async function loadConversation(id) {
-    activeConvId = id;
-    const conv = getActiveConversation();
-    // 대화별 작업 폴더 복원
-    if (conv && conv.cwd) {
-      const result = await window.electronAPI.cwd.set(conv.cwd);
-      if (result.success) {
-        currentCwd = conv.cwd;
-        updateCwdDisplay();
+    try {
+      activeConvId = id;
+      const conv = getActiveConversation();
+      // 대화별 작업 폴더 복원
+      if (conv && conv.cwd) {
+        const result = await window.electronAPI.cwd.set(conv.cwd);
+        if (result.success) {
+          currentCwd = conv.cwd;
+          updateCwdDisplay();
+        }
       }
+      renderMessages();
+      renderHistory();
+      syncStreamingUI();
+      $input.focus();
+    } catch (err) {
+      console.error('[loadConversation] failed:', err);
+      // 깨진 대화 데이터가 있어도 앱 전체 입력/클릭이 멈추지 않도록 복구
+      activeConvId = null;
+      renderMessages();
+      renderHistory();
+      syncStreamingUI();
+      $input.focus();
     }
-    renderMessages();
-    renderHistory();
-    syncStreamingUI();
-    $input.focus();
   }
 
   function getActiveConversation() {
@@ -2390,7 +2511,11 @@
     $messages.querySelectorAll('.message').forEach(el => el.remove());
 
     for (const msg of conv.messages) {
-      appendMessageDOM(msg);
+      try {
+        appendMessageDOM(msg);
+      } catch (err) {
+        console.error('[renderMessages] skip message:', err, msg?.id);
+      }
     }
     scrollToBottom({ force: true });
   }
@@ -2426,11 +2551,15 @@
     return el;
   }
 
-  function renderMarkdown(text) {
+  function renderMarkdown(text, options = {}) {
     if (!text) return '';
     try {
+      const skipPreprocess = Boolean(options?.skipPreprocess);
       const normalizedLinks = normalizeMarkdownLocalLinks(text);
-      return marked.parse(preprocessMarkdown(normalizedLinks));
+      const markdownSource = skipPreprocess
+        ? normalizedLinks
+        : preprocessMarkdown(normalizedLinks);
+      return marked.parse(markdownSource);
     } catch {
       return escapeHtml(text).replace(/\r?\n/g, '<br>');
     }
@@ -3495,6 +3624,503 @@
     return false;
   }
 
+  function parseOutputChannelMarker(line) {
+    const t = String(line || '').trim();
+    if (!t) return null;
+
+    const toChannel = (name) => {
+      const key = String(name || '').toLowerCase();
+      if (key === 'final' || key === 'assistant') return 'final';
+      if (key === 'analysis' || key === 'commentary' || key === 'summary' || key === 'user') return 'process';
+      return '';
+    };
+
+    let m = t.match(/^\[(analysis|commentary|summary|final|assistant|user)\]\s*(?::|-)?\s*(.*)$/i);
+    if (m) {
+      const channel = toChannel(m[1]);
+      if (!channel) return null;
+      return { channel, inline: String(m[2] || '').trim() };
+    }
+
+    m = t.match(/^(analysis|commentary|summary|final|assistant|user)\s*$/i);
+    if (m) {
+      const channel = toChannel(m[1]);
+      if (!channel) return null;
+      return { channel, inline: '' };
+    }
+
+    m = t.match(/^(analysis|commentary|summary|final|assistant|user)\s*[:\-]\s*(.*)$/i);
+    if (m) {
+      const channel = toChannel(m[1]);
+      if (!channel) return null;
+      return { channel, inline: String(m[2] || '').trim() };
+    }
+
+    return null;
+  }
+
+  function splitChannelTaggedOutput(text) {
+    const lines = String(text || '').split(/\r?\n/);
+    const finalLines = [];
+    const processLines = [];
+    let current = 'final';
+    let hasMarker = false;
+    let inFence = false;
+
+    const pushToCurrent = (line) => {
+      if (current === 'process') {
+        processLines.push(line);
+      } else {
+        finalLines.push(line);
+      }
+    };
+
+    for (const raw of lines) {
+      const line = String(raw || '');
+      const trimmed = line.trim();
+
+      if (!inFence) {
+        const marker = parseOutputChannelMarker(trimmed);
+        if (marker) {
+          hasMarker = true;
+          current = marker.channel;
+          if (marker.inline) pushToCurrent(marker.inline);
+          continue;
+        }
+      }
+
+      if (/^```/.test(trimmed)) {
+        inFence = !inFence;
+      }
+      pushToCurrent(line);
+    }
+
+    return {
+      hasMarker,
+      finalText: finalLines.join('\n').trim(),
+      processText: processLines.join('\n').trim(),
+    };
+  }
+
+  function mergeSectionText(baseText, extraText) {
+    const base = String(baseText || '').trim();
+    const extra = String(extraText || '').trim();
+    if (!base) return extra;
+    if (!extra) return base;
+    if (base.includes(extra)) return base;
+    return `${base}\n${extra}`;
+  }
+
+  function sanitizeFinalAnswerText(text) {
+    const lines = String(text || '').split(/\r?\n/);
+    const out = [];
+    let inFence = false;
+
+    for (let raw of lines) {
+      let line = String(raw || '');
+      let t = line.trim();
+      if (!t) {
+        if (!inFence) out.push('');
+        continue;
+      }
+
+      // 최종 답변 탭에서는 과정 중 코드/패치 블록을 제거
+      if (/^```/.test(t)) {
+        inFence = !inFence;
+        continue;
+      }
+      if (inFence) continue;
+
+      // 채널 표식 제거
+      const marker = parseOutputChannelMarker(t);
+      if (marker) {
+        if (marker.channel !== 'final') continue;
+        if (!marker.inline) continue;
+        line = marker.inline;
+        t = line.trim();
+      }
+
+      if (!t) continue;
+      if (isPromptMetaLine(t) || isSystemMetaLine(t) || isNoisyExecutionLogLine(t)) continue;
+      if (isLikelyCommandOutput(t) || isLikelyFilePathLine(t)) continue;
+      if (isLikelyDiffMetaLine(t) || isLikelyDiffChangeLine(t)) continue;
+      if (/^\*{3}\s*(Begin|End|Update|Add|Delete|Move)\b/i.test(t)) continue;
+      if (/^(analysis|commentary|summary|user)\s*[:\-]/i.test(t)) continue;
+      if (/^CODE$/i.test(t)) continue;
+
+      out.push(line);
+    }
+
+    return out
+      .join('\n')
+      .replace(/\n{3,}/g, '\n\n')
+      .trim();
+  }
+
+  function extractMessageTextFromJsonContent(content) {
+    if (!Array.isArray(content)) return '';
+    const parts = [];
+    for (const item of content) {
+      if (!item || typeof item !== 'object') continue;
+      if (typeof item.text === 'string' && item.text.trim()) parts.push(item.text);
+      else if (typeof item.output_text === 'string' && item.output_text.trim()) parts.push(item.output_text);
+      else if (typeof item.input_text === 'string' && item.input_text.trim()) parts.push(item.input_text);
+      else if (typeof item.summary_text === 'string' && item.summary_text.trim()) parts.push(item.summary_text);
+    }
+    return parts.join('\n').trim();
+  }
+
+  function appendUniqueLine(target, text) {
+    const normalized = normalizeDetailLine(String(text || ''));
+    if (!normalized) return;
+    const last = target[target.length - 1];
+    if (last === normalized) return;
+    if (target.length >= 480) target.shift();
+    target.push(normalized);
+  }
+
+  function appendUniqueParagraph(target, text) {
+    const value = String(text || '').trim();
+    if (!value) return;
+    const last = target[target.length - 1];
+    if (last === value) return;
+    if (target.length >= 120) target.shift();
+    target.push(value);
+  }
+
+  function compactPathTail(pathText, keepSegments = 3) {
+    const raw = String(pathText || '').trim();
+    if (!raw) return '';
+    const normalized = raw.replace(/\\/g, '/');
+    const parts = normalized.split('/').filter(Boolean);
+    if (parts.length <= keepSegments) return normalized;
+    return parts.slice(-keepSegments).join('/');
+  }
+
+  function summarizeFileChangeItem(item, maxEntries = 4, maxLen = 320) {
+    const changes = Array.isArray(item?.changes) ? item.changes : [];
+    if (changes.length === 0) return '';
+    const chunks = [];
+    for (const change of changes.slice(0, Math.max(1, maxEntries))) {
+      const pathText = normalizeDetailLine(String(change?.path || change?.file || ''));
+      const kind = normalizeDetailLine(String(change?.kind || change?.type || 'update'));
+      if (!pathText) continue;
+      const shortPath = compactPathTail(pathText, 4);
+      chunks.push(kind ? `${shortPath} (${kind})` : shortPath);
+    }
+    if (chunks.length === 0) return '';
+    const extra = changes.length > chunks.length ? ` +${changes.length - chunks.length}` : '';
+    return compactPreviewText(`파일 변경: ${chunks.join(', ')}${extra}`, maxLen);
+  }
+
+  function extractItemText(item) {
+    if (!item || typeof item !== 'object') return '';
+    const direct = ['text', 'message', 'output_text', 'summary_text'];
+    const parts = [];
+    for (const key of direct) {
+      const value = item[key];
+      if (typeof value === 'string' && value.trim()) parts.push(value);
+    }
+    const fileChangeSummary = summarizeFileChangeItem(item, 6, 420);
+    if (fileChangeSummary) parts.push(fileChangeSummary);
+    const content = extractMessageTextFromJsonContent(item.content);
+    if (content) parts.push(content);
+    return parts.join('\n').trim();
+  }
+
+  function appendAssistantTextFromJsonObject(obj, target) {
+    if (!obj || typeof obj !== 'object') return;
+    const contentText = extractMessageTextFromJsonContent(obj.content);
+    if (contentText) appendUniqueParagraph(target, contentText);
+
+    const textFields = ['text', 'message', 'output_text', 'summary_text', 'final_answer', 'last_agent_message'];
+    for (const field of textFields) {
+      const value = obj[field];
+      if (typeof value === 'string' && value.trim()) {
+        appendUniqueParagraph(target, value);
+      }
+    }
+  }
+
+  function collectAssistantParagraphsFromJson(node, target, depth = 0) {
+    if (depth > 8 || node == null) return;
+
+    if (Array.isArray(node)) {
+      for (const item of node) collectAssistantParagraphsFromJson(item, target, depth + 1);
+      return;
+    }
+
+    if (typeof node !== 'object') return;
+
+    const role = String(node.role || node?.author?.role || node?.speaker || '').toLowerCase();
+    if (role === 'assistant') {
+      appendAssistantTextFromJsonObject(node, target);
+    }
+
+    // task_complete 류 이벤트의 마지막 응답 텍스트를 보조 수집
+    if (typeof node.last_agent_message === 'string' && node.last_agent_message.trim()) {
+      appendUniqueParagraph(target, node.last_agent_message);
+    }
+
+    for (const [key, value] of Object.entries(node)) {
+      if (key === 'arguments' || key === 'input' || key === 'command') continue;
+      collectAssistantParagraphsFromJson(value, target, depth + 1);
+    }
+  }
+
+  function parseCodexJsonOutput(text) {
+    const source = String(text || '');
+    if (!source) return null;
+
+    const sections = {
+      session: { title: '세션 정보', content: '', summary: '', open: false },
+      mcp: { title: 'MCP 상태', content: '', summary: '', open: false },
+      thinking: { title: '생각 과정', content: '', summary: '', open: true },
+      response: { title: '응답', content: '', raw: '', summary: '', open: true },
+      tokens: { title: '토큰 사용량', content: '', summary: '', open: false },
+    };
+
+    const allLines = source.split(/\r?\n/);
+    const lines = allLines.length > 3600
+      ? [...allLines.slice(0, 120), ...allLines.slice(-3200)]
+      : allLines;
+
+    const sessionLines = [];
+    const processLines = [];
+    const finalLines = [];
+    let parsedJsonCount = 0;
+    let typedJsonCount = 0;
+    let fallbackFinalFromTask = '';
+    const parsedObjects = [];
+
+    for (const rawLine of lines) {
+      const trimmed = String(rawLine || '').trim();
+      if (!trimmed) continue;
+
+      let obj = null;
+      if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+        try {
+          obj = JSON.parse(trimmed);
+          parsedJsonCount += 1;
+        } catch {
+          obj = null;
+        }
+      }
+
+      if (!obj || typeof obj !== 'object') {
+        if (parsedJsonCount > 0 && !isNoisyExecutionLogLine(trimmed)) {
+          appendUniqueLine(processLines, trimmed);
+        }
+        continue;
+      }
+
+      const type = String(obj.type || '').toLowerCase();
+      if (type) {
+        typedJsonCount += 1;
+        parsedObjects.push(obj);
+        if (parsedObjects.length > 1000) parsedObjects.shift();
+      }
+
+      if (type === 'thread.started') {
+        const threadId = String(obj.thread_id || '').trim();
+        if (threadId) appendUniqueLine(sessionLines, `session id: ${threadId}`);
+        continue;
+      }
+
+      if (type === 'turn.started') {
+        appendUniqueLine(processLines, 'turn started');
+        continue;
+      }
+
+      if (type === 'turn.failed') {
+        const msg = String(obj?.error?.message || obj?.message || '').trim();
+        if (msg) appendUniqueLine(processLines, `turn failed: ${msg}`);
+        continue;
+      }
+
+      if (type === 'turn.completed') {
+        const usage = obj.usage || obj.payload?.usage || {};
+        const total = Number(usage.total_tokens) ||
+          (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
+        if (Number.isFinite(total) && total > 0) {
+          sections.tokens.summary = formatTokenNumber(total);
+          sections.tokens.content = `Tokens used: ${sections.tokens.summary}`;
+        }
+        continue;
+      }
+
+      if (type === 'error') {
+        const msg = String(obj?.message || obj?.error?.message || '').trim();
+        if (msg) appendUniqueLine(processLines, `error: ${msg}`);
+        continue;
+      }
+
+      if (type === 'session_meta') {
+        const payload = obj.payload || {};
+        if (typeof payload.id === 'string' && payload.id) appendUniqueLine(sessionLines, `session id: ${payload.id}`);
+        if (typeof payload.cwd === 'string' && payload.cwd) appendUniqueLine(sessionLines, `workdir: ${payload.cwd}`);
+        if (typeof payload.model_provider === 'string' && payload.model_provider) appendUniqueLine(sessionLines, `provider: ${payload.model_provider}`);
+        if (typeof payload.source === 'string' && payload.source) appendUniqueLine(sessionLines, `source: ${payload.source}`);
+        continue;
+      }
+
+      if (type === 'turn_context') {
+        const payload = obj.payload || {};
+        if (typeof payload.model === 'string' && payload.model) appendUniqueLine(sessionLines, `model: ${payload.model}`);
+        if (typeof payload.cwd === 'string' && payload.cwd) appendUniqueLine(sessionLines, `workdir: ${payload.cwd}`);
+        if (typeof payload.approval_policy === 'string' && payload.approval_policy) appendUniqueLine(sessionLines, `approval: ${payload.approval_policy}`);
+        if (typeof payload?.sandbox_policy?.type === 'string' && payload.sandbox_policy.type) appendUniqueLine(sessionLines, `sandbox: ${payload.sandbox_policy.type}`);
+        continue;
+      }
+
+      if (type === 'event_msg') {
+        const payload = obj.payload || {};
+        const eventType = String(payload.type || '').toLowerCase();
+        if (eventType === 'agent_message') {
+          const message = String(payload.message || '').trim();
+          const phase = String(payload.phase || '').toLowerCase();
+          if (message) {
+            if (/final/.test(phase)) appendUniqueParagraph(finalLines, message);
+            else appendUniqueLine(processLines, message);
+          }
+          continue;
+        }
+        if (eventType === 'agent_reasoning') {
+          appendUniqueLine(processLines, payload.text || payload.message || '');
+          continue;
+        }
+        if (eventType === 'task_complete') {
+          const lastMessage = String(payload.last_agent_message || '').trim();
+          if (lastMessage) fallbackFinalFromTask = lastMessage;
+          continue;
+        }
+        if (eventType === 'token_count') {
+          const totalTokens = Number(payload?.info?.total_token_usage?.total_tokens);
+          if (Number.isFinite(totalTokens) && totalTokens > 0) {
+            sections.tokens.summary = formatTokenNumber(totalTokens);
+            sections.tokens.content = `Tokens used: ${sections.tokens.summary}`;
+          }
+          const primaryUsed = Number(payload?.rate_limits?.primary?.used_percent);
+          const secondaryUsed = Number(payload?.rate_limits?.secondary?.used_percent);
+          if (Number.isFinite(primaryUsed) || Number.isFinite(secondaryUsed)) {
+            const pRemain = Number.isFinite(primaryUsed) ? `${Math.max(0, 100 - primaryUsed)}%` : '--';
+            const sRemain = Number.isFinite(secondaryUsed) ? `${Math.max(0, 100 - secondaryUsed)}%` : '--';
+            appendUniqueLine(processLines, `limit remaining: 5h ${pRemain}, weekly ${sRemain}`);
+          }
+          continue;
+        }
+        if (eventType && eventType !== 'user_message') {
+          appendUniqueLine(processLines, `event: ${eventType}`);
+        }
+        continue;
+      }
+
+      if (type === 'response_item') {
+        const payload = obj.payload || {};
+        const itemType = String(payload.type || '').toLowerCase();
+        if (itemType === 'message') {
+          const role = String(payload.role || '').toLowerCase();
+          const phase = String(payload.phase || '').toLowerCase();
+          const messageText = extractMessageTextFromJsonContent(payload.content);
+          if (role === 'assistant') {
+            if (/final/.test(phase)) appendUniqueParagraph(finalLines, messageText);
+            else if (phase && /(analysis|commentary|summary|tool|debug)/.test(phase)) appendUniqueLine(processLines, messageText);
+            else if (messageText) appendUniqueParagraph(finalLines, messageText);
+          }
+          continue;
+        }
+        if (itemType === 'reasoning') {
+          const summary = Array.isArray(payload.summary)
+            ? payload.summary.map(item => item?.text || item?.summary_text || '').filter(Boolean).join('\n')
+            : '';
+          appendUniqueLine(processLines, summary);
+          continue;
+        }
+        if (itemType === 'function_call' || itemType === 'custom_tool_call') {
+          const name = String(payload.name || 'tool');
+          const argsRaw = typeof payload.arguments === 'string'
+            ? payload.arguments
+            : JSON.stringify(payload.arguments || '');
+          const shortArgs = normalizeDetailLine(argsRaw).slice(0, 420);
+          appendUniqueLine(processLines, shortArgs ? `tool call: ${name} ${shortArgs}` : `tool call: ${name}`);
+          continue;
+        }
+        if (itemType === 'function_call_output' || itemType === 'custom_tool_call_output') {
+          const outputText = typeof payload.output === 'string'
+            ? payload.output
+            : extractMessageTextFromJsonContent(payload.output);
+          const firstLine = String(outputText || '')
+            .split(/\r?\n/)
+            .map(line => line.trim())
+            .find(Boolean) || '';
+          appendUniqueLine(processLines, firstLine ? `tool output: ${firstLine}` : 'tool output');
+        }
+      }
+
+      if (type === 'item.completed' || type === 'item.started' || type === 'item.delta' || type === 'item.updated') {
+        const item = obj.item || obj.payload?.item || obj.payload || {};
+        const itemType = String(item.type || obj.item_type || '').toLowerCase();
+        const itemText = extractItemText(item);
+        const deltaText = String(obj.delta?.text || obj.text || '').trim();
+        const mergedText = [itemText, deltaText].filter(Boolean).join('\n').trim();
+
+        if (itemType === 'agent_message' || itemType === 'assistant_message' || itemType === 'message') {
+          if (mergedText) appendUniqueParagraph(finalLines, mergedText);
+          continue;
+        }
+        if (itemType === 'reasoning' || itemType === 'analysis') {
+          if (mergedText) appendUniqueLine(processLines, mergedText);
+          continue;
+        }
+        if (itemType === 'file_change') {
+          const changeSummary = summarizeFileChangeItem(item, 6, 420) || mergedText;
+          if (changeSummary) appendUniqueLine(processLines, changeSummary);
+          continue;
+        }
+        if (itemType === 'tool_call' || itemType === 'tool_result' || itemType === 'command_execution' || itemType === 'file_change') {
+          if (mergedText) appendUniqueLine(processLines, mergedText);
+          continue;
+        }
+        if (mergedText) {
+          if (type === 'item.completed') appendUniqueLine(processLines, mergedText);
+        }
+      }
+    }
+
+    if (typedJsonCount === 0) return null;
+
+    // 이벤트 타입이 달라도 assistant role 텍스트를 전체 JSON 객체에서 재수집
+    if (finalLines.length === 0 && parsedObjects.length > 0) {
+      for (const obj of parsedObjects) {
+        collectAssistantParagraphsFromJson(obj, finalLines);
+      }
+    }
+
+    if (finalLines.length === 0 && fallbackFinalFromTask) {
+      appendUniqueParagraph(finalLines, fallbackFinalFromTask);
+    }
+
+    sections.session.content = sessionLines.join('\n').trim();
+    sections.thinking.content = processLines.join('\n').trim();
+    sections.response.content = finalLines.join('\n').trim();
+    sections.response.raw = sections.response.content;
+
+    if (!sections.response.content) {
+      const errorLine = [...processLines].reverse().find(line => /^(error:|turn failed:|실패:|오류:)/i.test(String(line || '').trim()));
+      if (errorLine) {
+        sections.response.content = String(errorLine).trim();
+      } else {
+        const failureHint = [...processLines].reverse().find(line => /(stream disconnected|reconnecting|failed|failure|timed out|timeout)/i.test(String(line || '').toLowerCase()));
+        if (failureHint) sections.response.content = String(failureHint).trim();
+      }
+    }
+
+    const modelMatch = sections.session.content.match(/model:\s*(\S+)/i);
+    if (modelMatch) sections.session.summary = modelMatch[1];
+
+    return sections;
+  }
+
   function stripNoisyExecutionLogLines(text) {
     return String(text || '')
       .split(/\r?\n/)
@@ -3516,6 +4142,56 @@
       if (isLikelyCommandOutput(bl) || isLikelyFilePathLine(bl)) terminalCount += 1;
     }
     return nonEmpty > 0 && terminalCount >= nonEmpty * 0.7;
+  }
+
+  function shouldMergeWrappedResponseLines(prevLine, nextLine) {
+    const prev = String(prevLine || '').trimEnd();
+    const next = String(nextLine || '').trimStart();
+    if (!prev || !next) return false;
+    if (prev.length > 280 || next.length > 280) return false;
+    if (isLikelyMarkdownStructureLine(prev) || isLikelyMarkdownStructureLine(next)) return false;
+    if (isLikelyDiffMetaLine(prev) || isLikelyDiffMetaLine(next)) return false;
+    if (isLikelyDiffChangeLine(prev) || isLikelyDiffChangeLine(next)) return false;
+    if (isLikelySearchHitLine(prev) || isLikelySearchHitLine(next)) return false;
+    if (isLikelyCommandOutput(prev) || isLikelyCommandOutput(next)) return false;
+    if (isLikelyFilePathLine(prev) || isLikelyFilePathLine(next)) return false;
+    if (/[.!?。]\s*$/.test(prev)) return false;
+    if (/^[\-*+]\s+/.test(next) || /^\d+\.\s+/.test(next)) return false;
+    if (/^```/.test(prev) || /^```/.test(next)) return false;
+
+    const merged = mergeWrappedTokenBoundary(prev, next);
+    return merged.length < (prev.length + next.length);
+  }
+
+  function mergeWrappedResponseLines(text) {
+    const source = String(text || '');
+    if (!source) return '';
+    if (source.length > 120000) return source;
+
+    const lines = source.split(/\r?\n/);
+    const out = [];
+    let inFence = false;
+
+    for (const raw of lines) {
+      const line = String(raw || '');
+      const trimmed = line.trimStart();
+      if (/^```/.test(trimmed)) {
+        inFence = !inFence;
+        out.push(line);
+        continue;
+      }
+
+      if (!inFence && out.length > 0 && shouldMergeWrappedResponseLines(out[out.length - 1], line)) {
+        const prev = out[out.length - 1].trimEnd();
+        const next = line.trimStart();
+        out[out.length - 1] = mergeWrappedTokenBoundary(prev, next);
+        continue;
+      }
+
+      out.push(line);
+    }
+
+    return out.join('\n');
   }
 
   function cleanCodexResponse(text) {
@@ -3617,7 +4293,7 @@
         result.push('```');
       }
     }
-    return result.join('\n');
+    return mergeWrappedResponseLines(result.join('\n'));
   }
 
   // === Codex 출력 구조화 ===
@@ -3635,15 +4311,25 @@
   //   [숫자]
   //   [응답 내용 중복 반복] ← 제거 대상
   function parseCodexOutput(text) {
+    const sourceText = String(text || '');
+    const jsonSections = parseCodexJsonOutput(sourceText);
+    if (jsonSections) {
+      ensureTokenSummary(jsonSections, sourceText);
+      jsonSections.response.raw = String(jsonSections.response.raw || jsonSections.response.content || '');
+      jsonSections.response.content = sanitizeFinalAnswerText(cleanCodexResponse(jsonSections.response.content || ''));
+      for (const key in jsonSections) jsonSections[key].content = String(jsonSections[key].content || '').trim();
+      return jsonSections;
+    }
+
     const sections = {
       session: { title: '세션 정보', content: '', summary: '', open: false },
       mcp: { title: 'MCP 상태', content: '', summary: '', open: false },
       thinking: { title: '생각 과정', content: '', summary: '', open: true },
-      response: { title: '응답', content: '', summary: '', open: true },
+      response: { title: '응답', content: '', raw: '', summary: '', open: true },
       tokens: { title: '토큰 사용량', content: '', summary: '', open: false },
     };
 
-    const lines = text.split(/\r?\n/);
+    const lines = sourceText.split(/\r?\n/);
     // 상태: null → 'session' → 'user_echo' → 'mcp' → 'thinking' → 'response' → 'tokens' → 'tail'
     let state = null;
     let tokensValue = '';
@@ -3760,26 +4446,54 @@
       // state === null → 아직 구조가 시작 안 됨 → 무시
     }
 
+    // response에 섞인 채널 표식(commentary/final 등)을 분리해
+    // 최종 답변은 answer로, 진행 중 메시지는 process(thinking)로 이동
+    const taggedFromResponse = splitChannelTaggedOutput(sections.response.content || '');
+    if (taggedFromResponse.hasMarker) {
+      if (taggedFromResponse.processText) {
+        sections.thinking.content = mergeSectionText(sections.thinking.content, taggedFromResponse.processText);
+      }
+      if (taggedFromResponse.finalText) {
+        sections.response.content = taggedFromResponse.finalText;
+      } else {
+        sections.response.content = '';
+      }
+    }
+
     // 요약 생성
     const modelMatch = sections.session.content.match(/model:\s*(\S+)/i);
     if (modelMatch) {
       sections.session.summary = modelMatch[1];
     }
 
-    // 파싱 실패 fallback: response가 비어있으면 전체에서 메타 제거 후 넣기
+    // 파싱 fallback:
+    // 1) 전체 텍스트에서 채널 표식 기반 final 재추출
+    // 2) 그래도 없으면 메타/노이즈 제거 텍스트를 최종 답변 후보로 사용
     if (!sections.response.content.trim()) {
-      const hasThinking = sections.thinking.content.trim().length > 0;
-      if (!hasThinking) {
-        sections.response.content = String(text)
+      const taggedFromAll = splitChannelTaggedOutput(String(text || ''));
+      if (taggedFromAll.hasMarker) {
+        if (taggedFromAll.processText) {
+          sections.thinking.content = mergeSectionText(sections.thinking.content, taggedFromAll.processText);
+        }
+        if (taggedFromAll.finalText) {
+          sections.response.content = taggedFromAll.finalText;
+        }
+      }
+    }
+
+    if (!sections.response.content.trim()) {
+      sections.response.content = sanitizeFinalAnswerText(
+        String(text)
           .split(/\r?\n/)
           .filter(l => !isSystemMetaLine(l) && !isNoisyExecutionLogLine(l) && !isPromptMetaLine(l))
           .join('\n')
-          .trim();
-      }
+      );
     }
 
     ensureTokenSummary(sections, text);
 
+    sections.response.raw = sections.response.content || '';
+    sections.response.content = sanitizeFinalAnswerText(cleanCodexResponse(sections.response.content || ''));
     for (const key in sections) sections[key].content = sections[key].content.trim();
     return sections;
   }
@@ -3797,13 +4511,7 @@
       .replace(/\s+/g, ' ')
       .trim();
     if (!cleaned) return '';
-
-    const searchSummary = summarizeSearchCommandLine(cleaned);
-    if (searchSummary && (cleaned.length > 120 || /\|/.test(cleaned) || /-g\s*["']?\*?\./i.test(cleaned))) {
-      return searchSummary;
-    }
-
-    return cleaned.slice(0, 220);
+    return cleaned.slice(0, 480);
   }
 
   function summarizeSearchCommandLine(line) {
@@ -3830,11 +4538,7 @@
     const cleaned = normalizeDetailLine(String(commandText || ''));
     if (!cleaned) return '';
     if (isNoisyExecutionLogLine(cleaned)) return '';
-    const searchSummary = summarizeSearchCommandLine(cleaned);
-    if (searchSummary && (cleaned.length > 120 || /\|/.test(cleaned) || /-g\s*["']?\*?\./i.test(cleaned))) {
-      return searchSummary;
-    }
-    return cleaned.slice(0, 220);
+    return cleaned.slice(0, 420);
   }
 
   function classifyProcessKind(line) {
@@ -3916,6 +4620,16 @@
     ).trim();
     if (!raw || isNoisyExecutionLogLine(raw)) return '';
 
+    if (raw.startsWith('{') && raw.endsWith('}')) {
+      try {
+        const obj = JSON.parse(raw);
+        const jsonDetail = toProcessJsonDetailLine(obj, 420);
+        if (jsonDetail) return normalizeDetailLine(jsonDetail);
+      } catch {
+        // JSON 파싱 실패 시 일반 텍스트 경로로 계속 처리
+      }
+    }
+
     const fileOp = raw.match(/^(?:\*\*\*\s*)?(Update|Add|Delete)\s+File:\s+(.+)$/i);
     if (fileOp) {
       const opMap = { update: '수정 파일', add: '추가 파일', delete: '삭제 파일' };
@@ -3930,12 +4644,10 @@
     if (!cleaned) return '';
 
     if (/\b(rg|grep|findstr)\b/i.test(cleaned)) {
-      const summarized = summarizeSearchCommandLine(cleaned);
-      if (summarized) return normalizeDetailLine(summarized);
-      return normalizeDetailLine(`탐색 명령: ${cleaned}`);
+      return normalizeDetailLine(`코드 탐색 명령: ${cleaned}`);
     }
     if (/^(get-childitem|ls|dir)\b/i.test(cleaned)) {
-      return normalizeDetailLine(`탐색 명령: ${cleaned}`);
+      return normalizeDetailLine(`파일 탐색 명령: ${cleaned}`);
     }
     if (/^(npm|pnpm|yarn|node|npx|git|python|pwsh|powershell|cmd)\b/i.test(cleaned)) {
       return normalizeDetailLine(`실행 명령: ${cleaned}`);
@@ -3986,7 +4698,10 @@
   function toReadableWorkLine(entry, fallbackKind) {
     const raw = String(entry?.raw || '').trim();
     if (!raw) return '';
-    if (extractCommandFromRawLine(raw)) return '';
+    const commandText = extractCommandFromRawLine(raw);
+    if (commandText) {
+      return normalizeDetailLine(`실행 명령: ${commandText}`);
+    }
 
     const detail = toReadableProcessDetailLine(raw);
     if (!detail) return '';
@@ -4008,9 +4723,11 @@
     return normalizeDetailLine(`작업 진행: ${detail}`);
   }
 
-  function buildProcessSummaryLines(entries, kind, maxLines = 4) {
+  function buildProcessSummaryLines(entries, kind, maxLines = null) {
     const source = Array.isArray(entries) ? entries : [];
     if (source.length === 0) return ['작업 진행 중입니다.', '관련 코드 위치를 확인 중입니다.', '출력을 수집하고 있습니다.'];
+    const hasLimit = Number.isFinite(maxLines) && Number(maxLines) > 0;
+    const max = hasLimit ? Number(maxLines) : Number.POSITIVE_INFINITY;
 
     const seen = new Set();
     const lines = [];
@@ -4022,21 +4739,23 @@
       if (!readable || seen.has(readable)) continue;
       seen.add(readable);
       lines.push(readable);
-      if (lines.length >= maxLines) break;
+      if (lines.length >= max) break;
     }
 
     const fallbackLines = kind === 'read' || kind === 'search'
       ? ['관련 코드 위치를 확인 중입니다.', '읽은 코드 기준으로 영향 범위를 점검 중입니다.', '다음 변경 지점을 정리 중입니다.']
       : ['현재 작업 단계를 진행 중입니다.', '연관 코드와 출력 내용을 점검 중입니다.', '결과를 정리해 다음 단계로 반영 중입니다.'];
 
-    for (const fallback of fallbackLines) {
-      if (lines.length >= 3 || lines.length >= maxLines) break;
-      if (seen.has(fallback)) continue;
-      seen.add(fallback);
-      lines.push(fallback);
+    if (lines.length === 0) {
+      for (const fallback of fallbackLines) {
+        if (lines.length >= 3 || lines.length >= max) break;
+        if (seen.has(fallback)) continue;
+        seen.add(fallback);
+        lines.push(fallback);
+      }
     }
 
-    return lines.slice(0, maxLines);
+    return hasLimit ? lines.slice(0, max) : lines;
   }
 
   function getActualProcessDetails(entries, kind, limit = 4) {
@@ -4078,7 +4797,8 @@
     return {
       maxLines: Math.max(1, Number(maxLines) || 19),
       lines: [],
-      seen: new Set(),
+      lastSignature: '',
+      pendingRawLine: '',
     };
   }
 
@@ -4086,15 +4806,277 @@
     if (!state) return;
     const normalized = normalizeDetailLine(String(line || ''));
     if (!normalized) return;
-    if (state.seen.has(normalized)) return;
-    state.seen.add(normalized);
+    const last = state.lines[state.lines.length - 1];
+    if (last === normalized) return;
     state.lines.push(normalized);
     while (state.lines.length > state.maxLines) {
       state.lines.shift();
     }
+    state.lastSignature = state.lines.join('\n');
   }
 
-  function buildStreamingPreviewCandidates(fullOutputText, limit = 8) {
+  function compactPreviewText(text, maxLen = 280) {
+    const compact = String(text || '').replace(/\s+/g, ' ').trim();
+    if (!compact) return '';
+    if (compact.length <= maxLen) return compact;
+    return `${compact.slice(0, Math.max(1, maxLen - 3))}...`;
+  }
+
+  function toProcessArgsDetailText(value, maxLen = 280) {
+    if (value == null) return '';
+    let text = '';
+    if (typeof value === 'string') {
+      text = value;
+    } else {
+      try {
+        text = JSON.stringify(value);
+      } catch {
+        text = String(value);
+      }
+    }
+    const normalized = normalizeDetailLine(text);
+    if (!normalized) return '';
+    return compactPreviewText(normalized, maxLen);
+  }
+
+  function toItemEventStatusLabel(eventType) {
+    const type = String(eventType || '').toLowerCase();
+    if (type.endsWith('.started')) return '시작';
+    if (type.endsWith('.completed')) return '완료';
+    if (type.endsWith('.updated')) return '업데이트';
+    if (type.endsWith('.delta')) return '스트리밍';
+    return '';
+  }
+
+  function toStreamingActionLabel(itemType) {
+    const type = String(itemType || '').toLowerCase();
+    if (type === 'command_execution') return '명령 실행';
+    if (type === 'file_change') return '파일 변경';
+    if (type === 'function_call' || type === 'tool_call' || type === 'custom_tool_call') return '도구 호출';
+    if (type === 'function_call_output' || type === 'tool_result' || type === 'custom_tool_call_output') return '도구 결과';
+    return '작업 단계';
+  }
+
+  function toStreamingDetailTail(parts, maxLen = 280) {
+    const merged = (Array.isArray(parts) ? parts : [])
+      .map(part => normalizeDetailLine(String(part || '')))
+      .filter(Boolean)
+      .join(' | ');
+    if (!merged) return '';
+    return compactPreviewText(merged, maxLen);
+  }
+
+  function toProcessJsonDetailLine(obj, maxLen = 300) {
+    if (!obj || typeof obj !== 'object') return '';
+    const type = String(obj.type || '').toLowerCase();
+
+    if (type === 'thread.started') {
+      const threadId = String(obj.thread_id || '').trim();
+      return threadId ? `세션 시작: ${threadId}` : '세션 시작';
+    }
+    if (type === 'turn.started') return '응답 생성 시작';
+    if (type === 'turn.completed') {
+      const usage = obj.usage || obj.payload?.usage || {};
+      const total = Number(usage.total_tokens)
+        || (Number(usage.input_tokens) || 0) + (Number(usage.output_tokens) || 0);
+      return Number.isFinite(total) && total > 0
+        ? `응답 완료 (tokens ${formatTokenNumber(total)})`
+        : '응답 완료';
+    }
+    if (type === 'turn.failed') {
+      const message = String(obj?.error?.message || obj?.message || '').trim();
+      return message ? `실패: ${compactPreviewText(message, maxLen)}` : '실패';
+    }
+    if (type === 'error') {
+      const message = String(obj?.message || obj?.error?.message || '').trim();
+      return message ? `오류: ${compactPreviewText(message, maxLen)}` : '오류';
+    }
+
+    if (type === 'event_msg') {
+      const payload = obj.payload || {};
+      const eventType = String(payload.type || '').toLowerCase();
+      if (eventType === 'agent_message') {
+        const phase = String(payload.phase || '').trim();
+        const text = String(payload.message || payload.text || '').trim();
+        if (text) {
+          const phaseLabel = phase ? ` (${phase})` : '';
+          return `응답 업데이트${phaseLabel}: ${compactPreviewText(text, maxLen)}`;
+        }
+        return '응답 생성 중...';
+      }
+      if (eventType === 'agent_reasoning') {
+        const text = String(payload.text || payload.message || '').trim();
+        return text ? `추론 업데이트: ${compactPreviewText(text, maxLen)}` : '추론 업데이트 수신';
+      }
+      if (eventType === 'token_count') {
+        const primaryUsed = Number(payload?.rate_limits?.primary?.used_percent);
+        const secondaryUsed = Number(payload?.rate_limits?.secondary?.used_percent);
+        if (Number.isFinite(primaryUsed) || Number.isFinite(secondaryUsed)) {
+          const pRemain = Number.isFinite(primaryUsed) ? `${Math.max(0, 100 - primaryUsed)}%` : '--';
+          const sRemain = Number.isFinite(secondaryUsed) ? `${Math.max(0, 100 - secondaryUsed)}%` : '--';
+          return `limit remaining: 5h ${pRemain}, weekly ${sRemain}`;
+        }
+      }
+      if (eventType) return `이벤트: ${eventType}`;
+    }
+
+    if (type === 'response_item') {
+      const payload = obj.payload || {};
+      const itemType = String(payload.type || '').toLowerCase();
+      if (itemType === 'function_call' || itemType === 'custom_tool_call') {
+        const name = String(payload.name || 'tool').trim();
+        const args = toProcessArgsDetailText(
+          payload.arguments ?? payload.input ?? payload.command ?? '',
+          Math.max(120, maxLen - 70)
+        );
+        const tail = toStreamingDetailTail([
+          name ? `도구=${name}` : '',
+          args ? `인자=${args}` : '',
+        ], maxLen);
+        return tail ? `도구 호출: ${tail}` : `도구 호출: ${name || 'tool'}`;
+      }
+      if (itemType === 'function_call_output' || itemType === 'custom_tool_call_output') {
+        const outputText = typeof payload.output === 'string'
+          ? payload.output
+          : extractMessageTextFromJsonContent(payload.output);
+        const firstLine = String(outputText || '')
+          .split(/\r?\n/)
+          .map(line => line.trim())
+          .find(Boolean) || '';
+        const name = String(payload.name || payload.tool_name || '').trim();
+        const tail = toStreamingDetailTail([
+          name ? `도구=${name}` : '',
+          firstLine ? `요약=${firstLine}` : '',
+        ], maxLen);
+        return tail ? `도구 결과: ${tail}` : '도구 결과 수신';
+      }
+      if (itemType === 'message') {
+        const messageText = extractMessageTextFromJsonContent(payload.content);
+        if (messageText) return `응답 본문: ${compactPreviewText(messageText, maxLen)}`;
+      }
+      if (itemType === 'reasoning') {
+        const summary = Array.isArray(payload.summary)
+          ? payload.summary.map(item => item?.text || item?.summary_text || '').filter(Boolean).join(' ')
+          : '';
+        if (summary) return `추론 요약: ${compactPreviewText(summary, maxLen)}`;
+      }
+    }
+
+    if (type === 'item.completed' || type === 'item.started' || type === 'item.delta' || type === 'item.updated') {
+      const item = obj.item || obj.payload?.item || obj.payload || {};
+      const itemType = String(item.type || obj.item_type || '').toLowerCase();
+      const itemName = String(item.name || item.tool_name || item.command_name || '').trim();
+      const itemText = extractItemText(item) || String(obj.delta?.text || obj.text || '').trim();
+      const statusLabel = toItemEventStatusLabel(type);
+      const statusSuffix = statusLabel ? ` (${statusLabel})` : '';
+
+      if (itemType === 'agent_message' || itemType === 'assistant_message' || itemType === 'message') {
+        return itemText ? `응답 업데이트${statusSuffix}: ${compactPreviewText(itemText, maxLen)}` : `응답 업데이트${statusSuffix}`;
+      }
+      if (itemType === 'reasoning' || itemType === 'analysis') {
+        return itemText ? `추론 단계${statusSuffix}: ${compactPreviewText(itemText, maxLen)}` : `추론 단계${statusSuffix}`;
+      }
+      if (itemType === 'function_call' || itemType === 'tool_call' || itemType === 'command_execution' || itemType === 'file_change') {
+        if (itemType === 'file_change') {
+          const changeSummary = summarizeFileChangeItem(item, 6, maxLen);
+          if (changeSummary) return `${toStreamingActionLabel(itemType)}${statusSuffix}: ${changeSummary}`;
+        }
+        const args = toProcessArgsDetailText(
+          item.arguments ?? item.input ?? item.command ?? '',
+          Math.max(120, maxLen - 110)
+        );
+        const label = toStreamingActionLabel(itemType);
+        const hint = extractLineHint(itemText);
+        const tail = toStreamingDetailTail([
+          itemName ? `대상=${itemName}` : '',
+          args ? `인자=${args}` : '',
+          hint ? hint.replace(/^대상:\s*/, '파일=') : '',
+          itemText ? `요약=${itemText}` : '',
+        ], maxLen);
+        return tail ? `${label}${statusSuffix}: ${tail}` : `${label}${statusSuffix}`;
+      }
+      if (itemType) return `아이템: ${itemType}`;
+    }
+
+    return type ? `이벤트: ${type}` : '';
+  }
+
+  function toStreamingPreviewLine(rawLine) {
+    const raw = stripNoisyExecutionFragments(String(rawLine || '')).trim();
+    if (!raw) return '';
+    if (isNoisyExecutionLogLine(raw) || isPromptMetaLine(raw)) return '';
+
+    if (raw.startsWith('{') && raw.endsWith('}')) {
+      try {
+        const obj = JSON.parse(raw);
+        const detail = toProcessJsonDetailLine(obj, 320);
+        if (detail) return detail;
+      } catch {
+        // JSON 미완성 라인은 일반 텍스트 경로로 처리
+      }
+    }
+
+    const cmd = extractCommandFromRawLine(raw);
+    if (cmd) return `실행: ${compactPreviewText(cmd, 320)}`;
+
+    const detail = toReadableProcessDetailLine(raw);
+    if (detail) return compactPreviewText(detail, 320);
+
+    return compactPreviewText(raw, 320);
+  }
+
+  function collectStreamingRawCandidates(fullOutputText, limit = 24) {
+    const text = String(fullOutputText || '');
+    if (!text) return [];
+    const tailText = text.length > 60000 ? text.slice(-60000) : text;
+    const rawLines = tailText.split(/\r?\n/);
+    const candidates = [];
+
+    for (const line of rawLines) {
+      const preview = toStreamingPreviewLine(line);
+      if (!preview) continue;
+      const last = candidates[candidates.length - 1];
+      if (last === preview) continue;
+      candidates.push(preview);
+    }
+    return candidates.slice(-Math.max(6, limit));
+  }
+
+  function updateStreamingPreviewFromChunk(state, chunkText) {
+    const st = state || createStreamingPreviewState(19);
+    const chunk = String(chunkText || '');
+    if (!chunk) return st.lines.slice();
+
+    const merged = `${st.pendingRawLine || ''}${chunk}`;
+    const normalized = merged.replace(/\r\n/g, '\n');
+    const parts = normalized.split('\n');
+    st.pendingRawLine = parts.pop() || '';
+
+    for (const part of parts) {
+      const preview = toStreamingPreviewLine(part);
+      if (preview) pushStreamingPreviewLine(st, preview);
+    }
+
+    // 줄바꿈 없이 길게 오는 경우에도 진행 상태가 비지 않도록 마지막 파편을 보조 표시
+    if (st.lines.length === 0 && st.pendingRawLine) {
+      const preview = toStreamingPreviewLine(st.pendingRawLine);
+      if (preview) pushStreamingPreviewLine(st, preview);
+    }
+
+    return st.lines.slice();
+  }
+
+  function buildStreamingPreviewCandidates(fullOutputText, limit = 8, parsedSections) {
+    const sectionProcessLines = String(parsedSections?.thinking?.content || '')
+      .split(/\r?\n/)
+      .map(line => normalizeDetailLine(line))
+      .filter(Boolean);
+
+    const rawCandidates = collectStreamingRawCandidates(fullOutputText, Math.max(8, limit));
+    if (sectionProcessLines.length > 0 || rawCandidates.length > 0) {
+      return [...sectionProcessLines, ...rawCandidates].slice(-Math.max(4, limit));
+    }
+
     const text = String(fullOutputText || '');
     const rawLines = text
       .split(/\r?\n/)
@@ -4122,17 +5104,32 @@
     return candidates.slice(-Math.max(4, limit));
   }
 
-  function updateStreamingPreviewLines(state, fullOutputText) {
+  function updateStreamingPreviewLines(state, fullOutputText, parsedSections) {
     const st = state || createStreamingPreviewState(19);
-    const candidates = buildStreamingPreviewCandidates(fullOutputText, st.maxLines * 2);
-    for (const line of candidates) {
-      pushStreamingPreviewLine(st, line);
-    }
-    if (st.lines.length === 0) {
-      for (const fallback of buildPendingThinkingUpdates(fullOutputText).slice(0, st.maxLines)) {
-        pushStreamingPreviewLine(st, fallback);
+    const candidates = buildStreamingPreviewCandidates(fullOutputText, st.maxLines * 2, parsedSections)
+      .map(line => normalizeDetailLine(String(line || '')))
+      .filter(Boolean)
+      .slice(-st.maxLines);
+
+    if (candidates.length === 0) {
+      const fallbacks = buildPendingThinkingUpdates(fullOutputText)
+        .slice(0, st.maxLines)
+        .map(line => normalizeDetailLine(line))
+        .filter(Boolean);
+      const fallbackSig = fallbacks.join('\n');
+      if (fallbackSig !== st.lastSignature) {
+        st.lines = fallbacks;
+        st.lastSignature = fallbackSig;
       }
+      return st.lines.slice();
     }
+
+    const signature = candidates.join('\n');
+    if (signature !== st.lastSignature) {
+      st.lines = candidates;
+      st.lastSignature = signature;
+    }
+
     return st.lines.slice();
   }
 
@@ -4146,8 +5143,120 @@
     logEl.innerHTML = safeLines.map((line) => (
       line
         ? `<div class="log-line">${escapeHtml(line)}</div>`
-        : '<div class="log-line is-placeholder">&nbsp;</div>'
+      : '<div class="log-line is-placeholder">&nbsp;</div>'
     )).join('');
+  }
+
+  function formatAnswerLineBreaks(text) {
+    const source = String(text || '').replace(/\r\n/g, '\n');
+    if (!source.trim()) return '';
+
+    const lines = source.split('\n');
+    const out = [];
+    let inFence = false;
+
+    for (const raw of lines) {
+      const line = String(raw || '');
+      const trimmed = line.trim();
+
+      if (/^```/.test(trimmed)) {
+        inFence = !inFence;
+        out.push(line);
+        continue;
+      }
+
+      if (inFence || !trimmed || isLikelyMarkdownStructureLine(trimmed)) {
+        out.push(line);
+        continue;
+      }
+
+      let formatted = line.trim();
+      const numberedCount = (formatted.match(/\b\d{1,2}[.)]\s+/g) || []).length;
+      if (numberedCount >= 2) {
+        // "1) ... 2) ..." 또는 "1. ... 2. ..." 패턴을 줄단위로 분리
+        formatted = formatted.replace(/\s+(?=\d{1,2}[.)]\s+)/g, '\n');
+      }
+
+      const sentenceTokenCount = (formatted.match(/[.!?。](?=\s+)/g) || []).length;
+      if (!/https?:\/\//i.test(formatted) && (sentenceTokenCount >= 2 || formatted.length >= 90)) {
+        formatted = formatted
+          .replace(/([.!?。])\s+(?=[^\s])/g, '$1\n')
+          .replace(/(다\.|요\.|죠\.|니다\.)\s+(?=[^\s])/g, '$1\n');
+      }
+
+      if (!/https?:\/\//i.test(formatted)) {
+        const semicolonCount = (formatted.match(/;\s+/g) || []).length;
+        if (semicolonCount >= 2 || formatted.length >= 120) {
+          formatted = formatted.replace(/;\s+(?=[^\s])/g, ';\n');
+        }
+      }
+
+      const segments = formatted.split('\n');
+      for (const segment of segments) {
+        const seg = String(segment || '').trim();
+        if (!seg) {
+          out.push('');
+          continue;
+        }
+
+        out.push(seg);
+      }
+    }
+
+    return out.join('\n').replace(/\n{3,}/g, '\n\n').trim();
+  }
+
+  function renderStreamingResponseWithProgress(responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES) {
+    const safeVisibleLines = Math.max(1, Number(visibleLines) || STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+    const rows = (Array.isArray(progressLines) ? progressLines : [])
+      .map(line => normalizeDetailLine(String(line || '')))
+      .filter(Boolean);
+    while (rows.length < safeVisibleLines) rows.unshift('');
+
+    const progressHtml = `<div class="stream-inline-progress">
+      <div class="stream-inline-progress-title">현재 진행</div>
+      <div class="stream-inline-progress-lines" style="--stream-inline-visible-lines:${safeVisibleLines};">
+        ${rows.map(line => (
+          line
+            ? `<div class="stream-inline-line">${escapeHtml(line)}</div>`
+            : '<div class="stream-inline-line is-placeholder">&nbsp;</div>'
+        )).join('')}
+      </div>
+    </div>`;
+
+    const answer = formatAnswerLineBreaks(String(responseText || '').trim());
+    const answerHtml = answer
+      ? renderMarkdown(answer)
+      : '<div class="streaming-answer-placeholder">응답 생성 중...</div>';
+
+    return `${progressHtml}<div class="streaming-answer-body">${answerHtml}</div>`;
+  }
+
+  function captureInlineProgressScrollState(containerEl) {
+    const linesEl = containerEl?.querySelector('.stream-inline-progress-lines');
+    if (!linesEl) return null;
+    const maxTop = Math.max(0, linesEl.scrollHeight - linesEl.clientHeight);
+    return {
+      scrollTop: linesEl.scrollTop,
+      nearBottom: (maxTop - linesEl.scrollTop) <= 4,
+    };
+  }
+
+  function restoreInlineProgressScrollState(containerEl, scrollState) {
+    if (!scrollState) return;
+    const linesEl = containerEl?.querySelector('.stream-inline-progress-lines');
+    if (!linesEl) return;
+    const maxTop = Math.max(0, linesEl.scrollHeight - linesEl.clientHeight);
+    linesEl.scrollTop = scrollState.nearBottom
+      ? maxTop
+      : Math.min(maxTop, Math.max(0, scrollState.scrollTop));
+  }
+
+  function renderStreamingResponsePreview(containerEl, responseText, progressLines, visibleLines = STREAM_INLINE_PROGRESS_VISIBLE_LINES) {
+    if (!containerEl) return;
+    const scrollState = captureInlineProgressScrollState(containerEl);
+    containerEl.innerHTML = renderStreamingResponseWithProgress(responseText, progressLines, visibleLines);
+    restoreInlineProgressScrollState(containerEl, scrollState);
   }
 
   function normalizeDetailLine(line) {
@@ -4157,7 +5266,7 @@
       .replace(/`([^`]+)`/g, '$1')
       .replace(/\s+/g, ' ')
       .trim()
-      .slice(0, 220);
+      .slice(0, 1200);
   }
 
   function extractCodeChangeDetailsFromResponse(responseText) {
@@ -4218,26 +5327,818 @@
     return details;
   }
 
-  function getCodeChangeDetails(sections) {
+  function extractCodeChangeDetailsFromRaw(rawText) {
+    if (!rawText) return [];
+    const details = [];
+    const lines = String(rawText).split(/\r?\n/);
+
+    for (const raw of lines) {
+      if (!raw) continue;
+      let line = String(raw).trim();
+      if (!line) continue;
+
+      // JSON 문자열 내부에 포함된 패치 라인을 잡기 위해 이스케이프를 일부 복원
+      line = line
+        .replace(/\\"/g, '"')
+        .replace(/\\n/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      const fileOp = line.match(/\*{3}\s*(Update|Add|Delete)\s+File:\s+([^"]+?)(?=\s*\*{3}|$)/i)
+        || line.match(/(?:^|\s)(Update|Add|Delete)\s+File:\s+(.+?)(?:\s*$)/i);
+      if (fileOp) {
+        const opMap = { update: '수정 파일', add: '추가 파일', delete: '삭제 파일' };
+        const op = opMap[fileOp[1].toLowerCase()] || '변경 파일';
+        const filePath = normalizeDetailLine(fileOp[2]);
+        if (filePath) details.push(`${op}: ${filePath}`);
+      }
+
+      const moveOp = line.match(/\*{3}\s*Move to:\s+([^"]+?)(?=\s*\*{3}|$)/i)
+        || line.match(/(?:^|\s)Move to:\s+(.+?)(?:\s*$)/i);
+      if (moveOp) {
+        const moved = normalizeDetailLine(moveOp[1]);
+        if (moved) details.push(`파일 이동: ${moved}`);
+      }
+
+      if (/\bapply_patch\b/i.test(line)) {
+        details.push('패치 적용 실행');
+      }
+
+      const mdLink = line.match(/\[([^\]]+)\]\(([^)\n]+)\)/);
+      if (mdLink && /[:\\/].+\.\w+/.test(mdLink[2])) {
+        const linkPath = normalizeDetailLine(mdLink[2]);
+        if (linkPath) details.push(`관련 파일: ${linkPath}`);
+      }
+    }
+
+    return details;
+  }
+
+  function getCodeChangeDetails(sections, rawText = '') {
     const fromResponse = extractCodeChangeDetailsFromResponse(sections.response.content || '');
     const fromThinking = extractCodeChangeDetailsFromThinking(sections.thinking.content || '');
-    const merged = [...fromResponse, ...fromThinking].map(normalizeDetailLine).filter(Boolean);
+    const fromRaw = extractCodeChangeDetailsFromRaw(rawText);
+    const merged = [...fromResponse, ...fromThinking, ...fromRaw].map(normalizeDetailLine).filter(Boolean);
     const deduped = [];
     const seen = new Set();
     for (const d of merged) {
+      // 단독 구두점/기호 라인은 코드 탭 잡음으로 제거
+      if (!/[A-Za-z0-9가-힣]/.test(d) && !/[:\\/]/.test(d)) continue;
       if (seen.has(d)) continue;
       seen.add(d);
       deduped.push(d);
     }
-    return deduped.slice(0, 10);
+    return deduped;
   }
 
-  function getCodexProcessItems(sections, isStreaming) {
-    const rawLines = (sections.thinking.content || '')
+  function collectJsonTextPayloads(rawText) {
+    const texts = [];
+    const lines = String(rawText || '').split(/\r?\n/);
+    for (const raw of lines) {
+      const trimmed = String(raw || '').trim();
+      if (!trimmed || !trimmed.startsWith('{') || !trimmed.endsWith('}')) continue;
+      try {
+        const obj = JSON.parse(trimmed);
+        const type = String(obj.type || '').toLowerCase();
+        if (type === 'item.completed' || type === 'item.started' || type === 'item.updated' || type === 'item.delta') {
+          const item = obj.item || obj.payload?.item || obj.payload || {};
+          const itemText = extractItemText(item) || String(obj.delta?.text || obj.text || '').trim();
+          if (itemText) texts.push(itemText);
+          continue;
+        }
+        if (type === 'event_msg') {
+          const payload = obj.payload || {};
+          const msgText = String(payload.message || payload.text || '').trim();
+          if (msgText) texts.push(msgText);
+          continue;
+        }
+      } catch {
+        // ignore malformed json line
+      }
+    }
+    return texts;
+  }
+
+  function hasPatchSignalInText(text) {
+    return /(\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File)|^@@|^diff --git|^---\s|^\+\+\+\s)/im
+      .test(String(text || ''));
+  }
+
+  function normalizePatchCandidateText(text) {
+    let value = String(text || '');
+    if (!value) return '';
+    if (/\\n/.test(value) && /(Begin Patch|Update File:|Add File:|Delete File:|Move to:|diff --git|@@)/i.test(value)) {
+      value = value.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
+    }
+    return value.replace(/\\"/g, '"');
+  }
+
+  function collectPatchStringsFromJsonNode(node, pushFn, depth = 0) {
+    if (depth > 8 || node == null) return;
+    if (typeof node === 'string') {
+      pushFn(node);
+      const trimmed = node.trim();
+      if (
+        trimmed.length > 2
+        && trimmed.length < 200000
+        && ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']')))
+      ) {
+        try {
+          const parsed = JSON.parse(trimmed);
+          collectPatchStringsFromJsonNode(parsed, pushFn, depth + 1);
+        } catch {
+          // ignore nested json parse failures
+        }
+      }
+      return;
+    }
+    if (Array.isArray(node)) {
+      for (const item of node) collectPatchStringsFromJsonNode(item, pushFn, depth + 1);
+      return;
+    }
+    if (typeof node !== 'object') return;
+    for (const value of Object.values(node)) {
+      collectPatchStringsFromJsonNode(value, pushFn, depth + 1);
+    }
+  }
+
+  function collectPatchCandidatesFromRaw(rawText) {
+    const source = String(rawText || '');
+    if (!source) return [];
+
+    const clipped = source.length > 220000 ? source.slice(-220000) : source;
+    const candidates = [];
+    const seen = new Set();
+    const pushCandidate = (value) => {
+      const normalized = normalizePatchCandidateText(value);
+      if (!normalized || !hasPatchSignalInText(normalized)) return;
+      const key = normalizeDetailLine(normalized).slice(0, 520);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      candidates.push(normalized);
+    };
+
+    pushCandidate(clipped);
+    for (const rawLine of clipped.split(/\r?\n/)) {
+      const line = String(rawLine || '').trim();
+      if (!line || !line.startsWith('{') || !line.endsWith('}')) continue;
+      try {
+        const obj = JSON.parse(line);
+        collectPatchStringsFromJsonNode(obj, pushCandidate);
+      } catch {
+        // ignore malformed json
+      }
+      if (candidates.length >= 18) break;
+    }
+
+    return candidates;
+  }
+
+  function extractPatchBlocksFromText(text, maxBlocks = 6) {
+    const source = normalizePatchCandidateText(text);
+    if (!source) return [];
+
+    const lines = source.split(/\r?\n/);
+    const blocks = [];
+    const seen = new Set();
+    const pushBlock = (blockLines) => {
+      const body = String((blockLines || []).join('\n') || '')
+        .replace(/\r/g, '')
+        .replace(/^```[a-zA-Z0-9_-]*\s*$/gm, '')
+        .trim();
+      if (!body) return;
+      const key = normalizeDetailLine(body).slice(0, 540);
+      if (!key || seen.has(key)) return;
+      seen.add(key);
+      blocks.push(body.length > 12000 ? `${body.slice(0, 12000)}\n...` : body);
+    };
+
+    const shouldKeepDiffLine = (rawLine) => {
+      const t = String(rawLine || '').trim();
+      if (!t) return false;
+      if (isLikelyDiffMetaLine(rawLine) || isLikelyDiffChangeLine(rawLine)) return true;
+      if (/^\*{3}\s*(Update|Add|Delete|Move(?:\s+to)?|End of File)\b/i.test(t)) return true;
+      return false;
+    };
+
+    // 문자열 중간에 포함된 Begin/End Patch 블록도 우선 추출
+    const patchRangeRe = /\*{3}\s*Begin Patch[\s\S]*?\*{3}\s*End Patch/gi;
+    for (const m of source.matchAll(patchRangeRe)) {
+      const block = String(m[0] || '').trim();
+      if (!block) continue;
+      pushBlock(block.split(/\r?\n/));
+      if (blocks.length >= maxBlocks) return blocks;
+    }
+
+    for (let i = 0; i < lines.length && blocks.length < maxBlocks; i++) {
+      const line = String(lines[i] || '');
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!/^\*{3}\s*Begin Patch\b/i.test(trimmed)) continue;
+
+      const block = [line];
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = String(lines[j] || '');
+        block.push(next);
+        if (/^\*{3}\s*End Patch\b/i.test(next.trim())) {
+          i = j;
+          break;
+        }
+        if (block.length > 1400) {
+          i = j;
+          break;
+        }
+      }
+      pushBlock(block);
+    }
+
+    for (let i = 0; i < lines.length && blocks.length < maxBlocks; i++) {
+      const line = String(lines[i] || '');
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      if (!(
+        /^\*{3}\s*(Update|Add|Delete|Move(?:\s+to)?)\s+File:/i.test(trimmed)
+        || /^diff --git\b/i.test(trimmed)
+        || /^@@/.test(trimmed)
+      )) continue;
+
+      const block = [line];
+      let consumed = i;
+      for (let j = i + 1; j < lines.length; j++) {
+        const next = String(lines[j] || '');
+        const nextTrim = next.trim();
+        if (!nextTrim) {
+          const lookahead = findNextNonEmptyLine(lines, j + 1);
+          if (lookahead && shouldKeepDiffLine(lookahead)) {
+            block.push(next);
+            consumed = j;
+            continue;
+          }
+          break;
+        }
+        if (!shouldKeepDiffLine(next)) break;
+        block.push(next);
+        consumed = j;
+        if (block.length > 1400) break;
+      }
+
+      const hasMeaningfulChange = block.some(entry => /^[+-]/.test(String(entry || '')) || /^@@/.test(String(entry || '').trim()));
+      if (hasMeaningfulChange) {
+        pushBlock(block);
+      }
+      i = consumed;
+    }
+
+    return blocks.slice(0, Math.max(1, maxBlocks));
+  }
+
+  function extractPatchBlocksFromRaw(rawText, maxBlocks = 6) {
+    const blocks = [];
+    const seen = new Set();
+    const candidates = collectPatchCandidatesFromRaw(rawText);
+    for (const candidate of candidates) {
+      const parsed = extractPatchBlocksFromText(candidate, maxBlocks);
+      for (const block of parsed) {
+        const key = normalizeDetailLine(block).slice(0, 540);
+        if (!key || seen.has(key)) continue;
+        seen.add(key);
+        blocks.push(block);
+        if (blocks.length >= maxBlocks) return blocks;
+      }
+    }
+    return blocks;
+  }
+
+  function summarizePatchFilesFromBlocks(patchBlocks) {
+    const fileMap = new Map();
+    const opMap = {
+      update: '수정 파일',
+      add: '추가 파일',
+      delete: '삭제 파일',
+      move: '파일 이동',
+      move_to: '파일 이동',
+    };
+
+    const ensureFile = (filePath, op) => {
+      const file = normalizeDetailLine(String(filePath || '').replace(/^['"]|['"]$/g, ''));
+      if (!file) return null;
+      const key = file.toLowerCase();
+      if (!fileMap.has(key)) {
+        fileMap.set(key, { file, ops: new Set(), added: 0, deleted: 0 });
+      }
+      const item = fileMap.get(key);
+      if (op) item.ops.add(op);
+      return item;
+    };
+
+    for (const block of Array.isArray(patchBlocks) ? patchBlocks : []) {
+      let current = null;
+      const lines = String(block || '').split(/\r?\n/);
+      for (const rawLine of lines) {
+        const line = String(rawLine || '');
+        const t = line.trim();
+        if (!t) continue;
+
+        let matched = t.match(/^\*{3}\s*(Update|Add|Delete)\s+File:\s+(.+)$/i);
+        if (matched) {
+          const op = opMap[String(matched[1] || '').toLowerCase()] || '변경 파일';
+          current = ensureFile(matched[2], op);
+          continue;
+        }
+        matched = t.match(/^\*{3}\s*Move to:\s+(.+)$/i);
+        if (matched) {
+          current = ensureFile(matched[1], '파일 이동');
+          continue;
+        }
+        matched = t.match(/^---\s*(Update|Add|Delete|Move(?:\s+to)?)\s*:\s*(.+)$/i);
+        if (matched) {
+          const rawOp = String(matched[1] || '').toLowerCase().replace(/\s+/g, '_');
+          const op = opMap[rawOp] || '변경 파일';
+          current = ensureFile(matched[2], op);
+          continue;
+        }
+        matched = t.match(/^diff --git\s+a\/(.+)\s+b\/(.+)$/i);
+        if (matched) {
+          current = ensureFile(matched[2], '변경 파일');
+          continue;
+        }
+        matched = t.match(/^\+\+\+\s+(?:b\/)?(.+)$/);
+        if (matched && !/^\+\+\+\s+\/dev\/null$/i.test(t)) {
+          current = ensureFile(matched[1], current ? [...current.ops][0] : '변경 파일');
+          continue;
+        }
+        if (!current) continue;
+
+        if (line.startsWith('+') && !line.startsWith('+++')) {
+          current.added += 1;
+        } else if (line.startsWith('-') && !line.startsWith('---')) {
+          current.deleted += 1;
+        }
+      }
+    }
+
+    return [...fileMap.values()];
+  }
+
+  function toCodeSnippetsForCodeTab(sections, rawText = '') {
+    const snippets = [];
+    const seen = new Set();
+    const pushSnippet = (lang, code) => {
+      const body = String(code || '').replace(/\r\n/g, '\n').trim();
+      if (!body) return;
+      const safeBody = body.length > 8000 ? `${body.slice(0, 8000)}\n...` : body;
+      const snippetLang = String(lang || '').trim().toLowerCase();
+      const key = `${snippetLang}|${safeBody.slice(0, 700)}`;
+      if (seen.has(key)) return;
+      seen.add(key);
+      snippets.push({ lang: snippetLang, code: safeBody });
+    };
+
+    const patchBlocks = extractPatchBlocksFromRaw(rawText, 4);
+    for (const patch of patchBlocks) {
+      pushSnippet('', patch);
+      if (snippets.length >= 8) return snippets;
+    }
+
+    const sources = [
+      String(sections?.response?.raw || ''),
+      String(sections?.thinking?.content || ''),
+      ...collectJsonTextPayloads(rawText),
+    ].filter(Boolean);
+
+    for (const source of sources) {
+      const extracted = extractPatchBlocksFromText(source, 2);
+      for (const patch of extracted) {
+        pushSnippet('', patch);
+        if (snippets.length >= 8) return snippets;
+      }
+    }
+
+    for (const source of sources) {
+      const text = String(source || '');
+      const fenceRe = /```([a-zA-Z0-9_+#.-]*)\n([\s\S]*?)```/g;
+      for (const m of text.matchAll(fenceRe)) {
+        pushSnippet(m[1] || '', m[2] || '');
+        if (snippets.length >= 8) return snippets;
+      }
+    }
+
+    if (snippets.length > 0) return snippets;
+
+    const combined = sources.join('\n');
+    const lines = combined.split(/\r?\n/);
+    let buffer = [];
+
+    const flushDiff = () => {
+      if (buffer.length === 0) return;
+      pushSnippet('', buffer.join('\n'));
+      buffer = [];
+    };
+
+    const isDiffLikeLine = (line) => {
+      const raw = String(line || '');
+      const t = raw.trim();
+      if (!t) return false;
+      if (/^\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File)/i.test(t)) return true;
+      if (/^@@/.test(t)) return true;
+      if (/^(diff --git|index\s+\S+|---\s|\+\+\+\s)/i.test(t)) return true;
+      if (/^[+\-].+/.test(raw)) return true;
+      return false;
+    };
+
+    for (const line of lines) {
+      const raw = String(line || '').replace(/\\"/g, '"');
+      if (isDiffLikeLine(raw)) {
+        buffer.push(raw);
+        continue;
+      }
+      if (buffer.length > 0) {
+        if (/^\s/.test(raw) && raw.trim()) {
+          buffer.push(raw);
+          continue;
+        }
+        flushDiff();
+        if (snippets.length >= 8) return snippets;
+      }
+    }
+    flushDiff();
+    return snippets;
+  }
+
+  function toSafeCodeFenceMarkdown(code, lang = '') {
+    const body = String(code || '');
+    const fence = body.includes('```') ? '````' : '```';
+    const header = lang ? `${fence}${lang}` : fence;
+    return `${header}\n${body}\n${fence}`;
+  }
+
+  function escapeMarkdownText(text) {
+    return String(text || '')
+      .replace(/\\/g, '\\\\')
+      .replace(/\[/g, '\\[')
+      .replace(/\]/g, '\\]')
+      .replace(/\*/g, '\\*')
+      .replace(/_/g, '\\_')
+      .replace(/`/g, '\\`');
+  }
+
+  function decodeUriComponentSafe(value) {
+    const raw = String(value || '');
+    if (!raw) return '';
+    try {
+      return decodeURIComponent(raw);
+    } catch {
+      return raw;
+    }
+  }
+
+  function normalizeCodeFilePathForGrouping(filePath) {
+    let value = normalizePatchFilePath(filePath);
+    if (!value) return '';
+
+    value = decodeUriComponentSafe(value)
+      .replace(/^file:\/\/\/?/i, '')
+      .replace(/^\/([A-Za-z]:\/)/, '$1')
+      .replace(/\\/g, '/')
+      .replace(/\/+/g, '/')
+      .trim();
+
+    const hashLine = /#L(\d+)(?::\d+)?$/i.exec(value);
+    if (hashLine) {
+      value = value.slice(0, hashLine.index);
+    } else {
+      const pathLine = /^(.*\.[A-Za-z0-9_+\-]+):(\d+)(?::\d+)?\)?$/.exec(value);
+      if (pathLine) {
+        value = pathLine[1];
+      }
+    }
+
+    const cwd = decodeUriComponentSafe(String(currentCwd || '').trim())
+      .replace(/\\/g, '/')
+      .replace(/^\/([A-Za-z]:\/)/, '$1')
+      .replace(/\/+$/, '');
+    if (cwd) {
+      const lowerValue = value.toLowerCase();
+      const lowerCwd = cwd.toLowerCase();
+      if (lowerValue === lowerCwd) return '.';
+      if (lowerValue.startsWith(`${lowerCwd}/`)) {
+        value = value.slice(cwd.length + 1);
+      }
+    }
+
+    return value.replace(/^\.\/+/, '').replace(/\/+$/, '').trim();
+  }
+
+  function toCodeFileGroupKey(filePath) {
+    const normalized = normalizeCodeFilePathForGrouping(filePath);
+    return normalized ? normalized.toLowerCase() : '';
+  }
+
+  function choosePreferredCodeFilePath(currentPath, nextPath) {
+    const a = normalizeCodeFilePathForGrouping(currentPath);
+    const b = normalizeCodeFilePathForGrouping(nextPath);
+    if (!a) return b || '';
+    if (!b) return a;
+
+    const aAbs = /^(?:[A-Za-z]:\/|\/[A-Za-z]:\/)/.test(a);
+    const bAbs = /^(?:[A-Za-z]:\/|\/[A-Za-z]:\/)/.test(b);
+    if (aAbs !== bAbs) return aAbs ? b : a;
+    if (a.length !== b.length) return a.length <= b.length ? a : b;
+    return a;
+  }
+
+  function toCodeFileMarkdownLink(filePath) {
+    const raw = normalizeDetailLine(String(filePath || ''))
+      .replace(/^['"]|['"]$/g, '')
+      .trim();
+    if (!raw) return '';
+
+    let pathPart = raw;
+    let linePart = '';
+
+    const hashLine = /#L(\d+)(?::\d+)?$/i.exec(pathPart);
+    if (hashLine) {
+      linePart = hashLine[1];
+      pathPart = pathPart.slice(0, hashLine.index);
+    } else {
+      const pathLine = /^(.*\.[A-Za-z0-9_+\-]+):(\d+)(?::\d+)?\)?$/.exec(pathPart);
+      if (pathLine) {
+        pathPart = pathLine[1];
+        linePart = pathLine[2];
+      }
+    }
+
+    const toLocalLinkPath = (value) => {
+      const input = decodeUriComponentSafe(String(value || '').trim());
+      if (!input) return '';
+      if (
+        /^\/?[A-Za-z]:[\\/]/.test(input)
+        || /^file:\/\/\/?/i.test(input)
+        || /^\/(?:Users|home|tmp|var|opt|etc)\//.test(input)
+      ) {
+        return normalizeLocalFileLinkTarget(input) || input;
+      }
+      const rel = input
+        .replace(/\\/g, '/')
+        .replace(/^\.\/+/, '')
+        .replace(/^\/+/, '')
+        .trim();
+      if (!rel) return '';
+      const cwd = decodeUriComponentSafe(String(currentCwd || '').trim());
+      if (!cwd) {
+        return normalizeLocalFileLinkTarget(`./${rel}`) || `./${rel}`;
+      }
+      const normalizedCwd = cwd.replace(/\\/g, '/').replace(/\/+$/, '');
+      return normalizeLocalFileLinkTarget(`${normalizedCwd}/${rel}`) || `${normalizedCwd}/${rel}`;
+    };
+
+    const linkedPath = toLocalLinkPath(pathPart);
+    const hrefCandidate = linePart && linkedPath ? `${linkedPath}#L${linePart}` : linkedPath;
+    const href = normalizeLocalFileLinkTarget(hrefCandidate);
+    if (!href) return `\`${escapeMarkdownText(raw)}\``;
+
+    const displayBase = normalizeCodeFilePathForGrouping(pathPart)
+      || decodeUriComponentSafe(pathPart).replace(/^\/([A-Za-z]:\/)/, '$1');
+    const display = linePart ? `${displayBase}:${linePart}` : displayBase;
+    return `[${escapeMarkdownText(display || raw)}](${href})`;
+  }
+
+  function isMeaningfulPatchBlock(blockText) {
+    const text = String(blockText || '');
+    if (!text.trim()) return false;
+    if (!/(^\*{3}\s*Begin Patch\b|^\*{3}\s*(Update|Add|Delete)\s+File:|^diff --git\b|^@@)/mi.test(text)) {
+      return false;
+    }
+    const changeCount = text
+      .split(/\r?\n/)
+      .filter(line => /^[+-]/.test(String(line || '')) && !/^(---|\+\+\+)/.test(String(line || '')))
+      .length;
+    return changeCount > 0;
+  }
+
+  function normalizePatchFilePath(filePath) {
+    let value = normalizeDetailLine(String(filePath || '').trim());
+    if (!value) return '';
+    value = value.replace(/^['"`]+|['"`]+$/g, '');
+    value = value.replace(/^a\//, '').replace(/^b\//, '');
+    value = value.replace(/[)\],;]+$/, '');
+    return value.trim();
+  }
+
+  function splitPatchBlockByFile(blockText) {
+    const lines = String(blockText || '').split(/\r?\n/);
+    const chunks = [];
+    let currentFile = '';
+    let buffer = [];
+
+    const flush = () => {
+      const body = buffer.join('\n').trim();
+      if (!currentFile || !body) {
+        buffer = [];
+        return;
+      }
+      chunks.push({ file: currentFile, diff: body });
+      buffer = [];
+    };
+
+    for (const rawLine of lines) {
+      const line = String(rawLine || '');
+      const trimmed = line.trim();
+
+      const diffMatch = /^diff --git\s+a\/(.+?)\s+b\/(.+)$/i.exec(trimmed);
+      if (diffMatch) {
+        flush();
+        currentFile = normalizePatchFilePath(diffMatch[2]);
+        buffer.push(line);
+        continue;
+      }
+
+      const fileOp = /^\*{3}\s*(Update|Add|Delete)\s+File:\s+(.+)$/i.exec(trimmed);
+      if (fileOp) {
+        flush();
+        currentFile = normalizePatchFilePath(fileOp[2]);
+        buffer.push(line);
+        continue;
+      }
+
+      if (!currentFile) {
+        const plusMatch = /^\+\+\+\s+(?:b\/)?(.+)$/.exec(trimmed);
+        if (plusMatch && !/^\+\+\+\s+\/dev\/null$/i.test(trimmed)) {
+          currentFile = normalizePatchFilePath(plusMatch[1]);
+        }
+      }
+
+      if (currentFile) {
+        buffer.push(line);
+      }
+    }
+
+    flush();
+    return chunks;
+  }
+
+  function buildFileDiffBlocks(patchBlocks, maxFiles = 8) {
+    const byFile = new Map();
+    const chunkSeen = new Set();
+
+    const hasMeaningfulDiffChange = (diffText) => String(diffText || '')
+      .split(/\r?\n/)
+      .some(line => /^[+-]/.test(String(line || '')) && !/^(---|\+\+\+)/.test(String(line || '')));
+
+    for (const block of Array.isArray(patchBlocks) ? patchBlocks : []) {
+      const pieces = splitPatchBlockByFile(block);
+      for (const piece of pieces) {
+        const file = normalizePatchFilePath(piece?.file || '');
+        const diff = String(piece?.diff || '').trim();
+        if (!file || !diff) continue;
+        if (!hasMeaningfulDiffChange(diff)) continue;
+        const fileKey = toCodeFileGroupKey(file) || file.toLowerCase();
+        const displayFile = normalizeCodeFilePathForGrouping(file) || file;
+        const chunkKey = `${fileKey}|${normalizeDetailLine(diff).slice(0, 520)}`;
+        if (chunkSeen.has(chunkKey)) continue;
+        chunkSeen.add(chunkKey);
+        if (!byFile.has(fileKey)) {
+          byFile.set(fileKey, { file: displayFile, chunks: [] });
+        }
+        const entry = byFile.get(fileKey);
+        entry.file = choosePreferredCodeFilePath(entry.file, displayFile);
+        entry.chunks.push(diff);
+      }
+    }
+
+    const out = [];
+    for (const item of byFile.values()) {
+      const merged = item.chunks.join('\n');
+      if (!hasMeaningfulDiffChange(merged)) continue;
+      out.push({
+        file: item.file,
+        diff: merged.length > 20000 ? `${merged.slice(0, 20000)}\n...` : merged,
+      });
+      if (out.length >= Math.max(1, maxFiles)) break;
+    }
+    return out;
+  }
+
+  function buildCodexCodeTabMarkdown(sections, rawText = '') {
+    const details = getCodeChangeDetails(sections, rawText);
+    const sourcePatchText = [
+      String(sections?.response?.raw || ''),
+      String(sections?.thinking?.content || ''),
+      ...collectJsonTextPayloads(rawText),
+    ].filter(Boolean).join('\n');
+    const patchBlocksRaw = extractPatchBlocksFromRaw(rawText, 4);
+    const patchBlocksFromSource = extractPatchBlocksFromText(sourcePatchText, 4);
+    const patchBlockSeen = new Set();
+    const patchBlocks = [];
+    for (const block of [...patchBlocksRaw, ...patchBlocksFromSource]) {
+      const key = normalizeDetailLine(block).slice(0, 540);
+      if (!key || patchBlockSeen.has(key)) continue;
+      if (!isMeaningfulPatchBlock(block)) continue;
+      patchBlockSeen.add(key);
+      patchBlocks.push(block);
+      if (patchBlocks.length >= 4) break;
+    }
+    const fileDiffBlocks = buildFileDiffBlocks(patchBlocks, 8);
+    const patchFiles = summarizePatchFilesFromBlocks(patchBlocks);
+    if ((!details || details.length === 0) && patchFiles.length === 0) {
+      return '코드 변경 내용이 감지되지 않았습니다.';
+    }
+
+    const fileMap = new Map();
+    const methodLines = [];
+
+    for (const detail of details) {
+      const line = normalizeDetailLine(detail);
+      if (!line) continue;
+
+      const fileOp = line.match(/^(수정 파일|추가 파일|삭제 파일|파일 이동|관련 파일)\s*:\s*(.+)$/i);
+      if (fileOp) {
+        const op = String(fileOp[1] || '').trim();
+        const file = String(fileOp[2] || '').trim();
+        const normalizedFile = normalizeCodeFilePathForGrouping(file) || normalizePatchFilePath(file) || file;
+        const key = toCodeFileGroupKey(normalizedFile) || normalizedFile.toLowerCase();
+        if (!fileMap.has(key)) {
+          fileMap.set(key, { file: normalizedFile, ops: new Set(), added: 0, deleted: 0 });
+        }
+        const entry = fileMap.get(key);
+        entry.file = choosePreferredCodeFilePath(entry.file, normalizedFile);
+        entry.ops.add(op);
+        continue;
+      }
+
+      methodLines.push(line);
+    }
+
+    for (const patchFile of patchFiles) {
+      const file = String(patchFile?.file || '').trim();
+      if (!file) continue;
+      const normalizedFile = normalizeCodeFilePathForGrouping(file) || normalizePatchFilePath(file) || file;
+      const key = toCodeFileGroupKey(normalizedFile) || normalizedFile.toLowerCase();
+      if (!fileMap.has(key)) {
+        fileMap.set(key, { file: normalizedFile, ops: new Set(), added: 0, deleted: 0 });
+      }
+      const item = fileMap.get(key);
+      item.file = choosePreferredCodeFilePath(item.file, normalizedFile);
+      const opList = patchFile?.ops instanceof Set
+        ? [...patchFile.ops]
+        : (Array.isArray(patchFile?.ops) ? patchFile.ops : []);
+      for (const op of opList) {
+        item.ops.add(op);
+      }
+      item.added += Number(patchFile.added) || 0;
+      item.deleted += Number(patchFile.deleted) || 0;
+    }
+
+    const lines = [];
+    lines.push('### 변경 파일');
+    if (fileMap.size === 0) {
+      lines.push('- 감지된 파일 경로가 없습니다.');
+    } else {
+      for (const { file, ops, added, deleted } of fileMap.values()) {
+        const opText = [...ops].join(', ') || '변경 파일';
+        const diffText = (Number(added) > 0 || Number(deleted) > 0)
+          ? ` (+${Number(added) || 0} / -${Number(deleted) || 0})`
+          : '';
+        lines.push(`- ${escapeMarkdownText(`${opText}${diffText}`)}: ${toCodeFileMarkdownLink(file)}`);
+      }
+    }
+
+    if (methodLines.length > 0) {
+      lines.push('', '### 변경 방식');
+      for (const line of methodLines) {
+        lines.push(`- ${escapeMarkdownText(line)}`);
+      }
+    }
+
+    if (fileDiffBlocks.length > 0) {
+      lines.push('', '### 변경 Diff');
+      fileDiffBlocks.forEach((entry) => {
+        lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
+        lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
+      });
+    } else {
+      lines.push('', '### 변경 Diff');
+      lines.push('- Unified diff(`+`, `-`)를 찾지 못했습니다.');
+    }
+
+    return lines.join('\n');
+  }
+
+  function renderCodexCodeBrief(sections, rawText = '') {
+    const markdown = buildCodexCodeTabMarkdown(sections, rawText);
+    return `<div class="code-brief">${renderMarkdown(markdown, { skipPreprocess: true })}</div>`;
+  }
+
+  function getCodexProcessItems(sections, isStreaming, rawText = '') {
+    const processSourceText = String(rawText || sections.thinking.content || '');
+    const sampledProcessText = processSourceText.length > 180000
+      ? processSourceText.slice(-180000)
+      : processSourceText;
+    const rawLines = sampledProcessText
       .split(/\r?\n/)
       .map(line => line.trim())
       .filter(Boolean);
-    const processEntries = buildProcessEntriesFromRawLines(rawLines).slice(-180);
+    const processEntries = buildProcessEntriesFromRawLines(rawLines);
 
     const items = [];
     const seen = new Set();
@@ -4257,7 +6158,7 @@
       });
     }
 
-    const codeChangeDetails = getCodeChangeDetails(sections);
+    const codeChangeDetails = getCodeChangeDetails(sections, rawText);
     if (codeChangeDetails.length > 0) {
       items.push({
         kind: 'edit',
@@ -4283,14 +6184,14 @@
       if (Array.isArray(item.extra) && item.extra.length > 0) continue;
       const command = getLatestProcessCommand(processEntries, item.kind) || getLatestProcessCommand(processEntries);
       if (command) item.command = command;
-      item.extra = buildProcessSummaryLines(processEntries, item.kind, 4);
+      item.extra = buildProcessSummaryLines(processEntries, item.kind);
     }
 
     return items;
   }
 
-  function renderCodexProcessBrief(sections, isStreaming) {
-    const items = getCodexProcessItems(sections, isStreaming);
+  function renderCodexProcessBrief(sections, isStreaming, rawText = '') {
+    const items = getCodexProcessItems(sections, isStreaming, rawText);
     const title = isStreaming ? '과정 스택 (실시간)' : '과정 스택';
     return `<div class="process-brief">
       <div class="process-title-row">
@@ -4299,16 +6200,24 @@
       </div>
       <div class="process-stack">
         ${items.map((item, idx) => `
-          <div class="process-item process-${item.kind}">
-            <div class="process-index">${String(idx + 1).padStart(2, '0')}</div>
+          <details class="process-item process-${item.kind}"${isStreaming && idx === items.length - 1 ? ' open' : ''}>
+            <summary class="process-item-summary">
+              <span class="process-index">${String(idx + 1).padStart(2, '0')}</span>
+              <span class="process-summary-main">
+                <span class="process-kind">${escapeHtml(item.title)}</span>
+                <span class="process-detail">${escapeHtml(item.command ? `진행 명령어: ${item.command}` : item.detail)}</span>
+              </span>
+            </summary>
             <div class="process-content">
-              <div class="process-kind">${escapeHtml(item.title)}</div>
-              <div class="process-detail">${escapeHtml(item.command ? `진행 명령어: ${item.command}` : item.detail)}</div>
-              ${Array.isArray(item.extra) && item.extra.length > 0
-                ? `<div class="process-extra-title">${item.title === '코드 변경 내용' ? '코드 변경 내용' : '과정 상세 내용'}</div><ul class="process-extra">${item.extra.map(extra => `<li>${escapeHtml(extra)}</li>`).join('')}</ul>`
-                : ''}
+              <div class="process-extra-title">${item.title === '코드 변경 내용' ? '코드 변경 내용' : '과정 상세 내용'}</div>
+              <div class="process-extra-scroll">
+              <ul class="process-extra">${(Array.isArray(item.extra) && item.extra.length > 0
+                ? item.extra
+                : [item.command ? `진행 명령어: ${item.command}` : item.detail]
+              ).map(extra => `<li>${escapeHtml(extra)}</li>`).join('')}</ul>
+              </div>
             </div>
-          </div>
+          </details>
         `).join('')}
       </div>
     </div>`;
@@ -4316,22 +6225,28 @@
 
   // opts: { activeTab, isStreaming }
   function renderCodexStructured(sections, opts) {
-    const { activeTab = 'answer', isStreaming = false } = opts || {};
-    const cleanedResponse = cleanCodexResponse(sections.response.content);
-    const responseHtml = renderMarkdown(cleanedResponse);
-    const processHtml = renderCodexProcessBrief(sections, isStreaming);
+    const { activeTab = 'answer', isStreaming = false, rawText = '' } = opts || {};
+    const currentTab = ['answer', 'process', 'code'].includes(activeTab) ? activeTab : 'answer';
+    const finalAnswer = formatAnswerLineBreaks(sanitizeFinalAnswerText(sections.response.content || ''));
+    const responseHtml = renderMarkdown(finalAnswer || '최종 답변을 정리했습니다.');
+    const processHtml = renderCodexProcessBrief(sections, isStreaming, rawText);
+    const codeHtml = renderCodexCodeBrief(sections, rawText);
 
-    const answerActive = activeTab === 'answer' ? ' active' : '';
-    const processActive = activeTab === 'process' ? ' active' : '';
-    const answerHidden = activeTab !== 'answer' ? ' hidden' : '';
-    const processHidden = activeTab !== 'process' ? ' hidden' : '';
+    const answerActive = currentTab === 'answer' ? ' active' : '';
+    const processActive = currentTab === 'process' ? ' active' : '';
+    const codeActive = currentTab === 'code' ? ' active' : '';
+    const answerHidden = currentTab !== 'answer' ? ' hidden' : '';
+    const processHidden = currentTab !== 'process' ? ' hidden' : '';
+    const codeHidden = currentTab !== 'code' ? ' hidden' : '';
 
     return `<div class="msg-tabs">
       <button class="msg-tab${answerActive}" data-tab="answer">답변</button>
       <button class="msg-tab${processActive}" data-tab="process">과정</button>
+      <button class="msg-tab${codeActive}" data-tab="code">코드</button>
     </div>
     <div class="msg-tab-content${answerHidden}" data-tab-content="answer">${responseHtml}</div>
-    <div class="msg-tab-content${processHidden}" data-tab-content="process">${processHtml}</div>`;
+    <div class="msg-tab-content${processHidden}" data-tab-content="process">${processHtml}</div>
+    <div class="msg-tab-content${codeHidden}" data-tab-content="code">${codeHtml}</div>`;
   }
 
   function updateCodexStatusbar(sections) {
@@ -4384,16 +6299,19 @@
   // 현재 탭 상태를 DOM에서 캡처
   function captureCodexUIState(container) {
     const activeTab = container.querySelector('.msg-tab.active');
-    const currentTab = activeTab ? activeTab.dataset.tab : 'process';
+    const currentTab = activeTab ? activeTab.dataset.tab : 'answer';
     return { currentTab };
   }
 
-  function renderAIBody(msg) {
+  function renderAIBody(msg, opts = {}) {
     if (msg.profileId === 'codex' && msg.content) {
       const sections = parseCodexOutput(msg.content);
       updateCodexRuntimeInfo(sections);
-      if (sections.response.content) {
-        return renderCodexStructured(sections);
+      if (sections.response.content || sections.thinking.content) {
+        return renderCodexStructured(sections, {
+          rawText: msg.content,
+          activeTab: opts?.activeTab,
+        });
       }
     }
     return renderMarkdown(msg.content);
@@ -4435,7 +6353,6 @@
     }
     const convId = activeConvId;
     const conv = getActiveConversation();
-    const label = subcommand === '--version' ? 'codex --version' : `codex ${subcommand}`;
 
     // 사용자 메시지 추가
     const userMsg = {
@@ -4463,17 +6380,13 @@
     aiEl.classList.add('streaming');
 
     const bodyEl = aiEl.querySelector('.msg-body');
-    bodyEl.innerHTML = `<div class="thinking-indicator">
-      <div class="thinking-header">
-        <div class="thinking-dots"><span></span><span></span><span></span></div>
-        <span class="thinking-text">${label} 실행 중...</span>
-      </div>
-    </div>`;
+    bodyEl.innerHTML = '';
     scrollToBottom();
 
     const streamId = aiMsg.id;
     let fullOutput = '';
     let finished = false;
+    let exitCode = null;
 
     // 대화별 스트리밍 상태 등록
     const streamState = { streamId };
@@ -4487,7 +6400,7 @@
 
     const unsubStream = window.electronAPI.cli.onStream(({ id, chunk }) => {
       if (id !== streamId || finished) return;
-      fullOutput += chunk;
+      fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
       autoSaveIfNeeded();
       if (convId !== activeConvId) return;
@@ -4495,8 +6408,9 @@
       scrollToBottom();
     });
 
-    const unsubDone = window.electronAPI.cli.onDone(({ id }) => {
+    const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
       if (id !== streamId) return;
+      exitCode = Number.isFinite(Number(code)) ? Number(code) : null;
       finish();
     });
 
@@ -4510,6 +6424,15 @@
       unsubStream();
       unsubDone();
       void refreshCodexRateLimits('after-subcommand');
+
+      if (!String(aiMsg.content || '').trim()) {
+        if (exitCode != null && exitCode !== 0) {
+          aiMsg.role = 'error';
+          aiMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
+        } else {
+          aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
+        }
+      }
 
       if (convId === activeConvId) {
         aiEl.classList.remove('streaming');
@@ -4600,30 +6523,67 @@
     aiEl.classList.add('streaming');
 
     const bodyEl = aiEl.querySelector('.msg-body');
-    bodyEl.innerHTML = `<div class="thinking-indicator">
+    bodyEl.innerHTML = SHOW_STREAMING_WORK_PANEL
+      ? `<div class="thinking-indicator">
       <div class="thinking-header">
         <div class="thinking-dots"><span></span><span></span><span></span></div>
         <span class="thinking-text">${profile.name} 작업 중...</span>
         <span class="thinking-elapsed">0초</span>
       </div>
       <div class="thinking-log"></div>
-    </div>`;
+    </div>`
+      : '';
     scrollToBottom();
 
     const startTime = Date.now();
-    const elapsedEl = bodyEl.querySelector('.thinking-elapsed');
-    const elapsedTimer = setInterval(() => {
-      if (!elapsedEl) return;
-      const sec = Math.floor((Date.now() - startTime) / 1000);
-      elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
-    }, 1000);
+    const elapsedTimer = SHOW_STREAMING_WORK_PANEL
+      ? setInterval(() => {
+        const elapsedEl = bodyEl.querySelector('.thinking-elapsed');
+        if (!elapsedEl) return;
+        const sec = Math.floor((Date.now() - startTime) / 1000);
+        elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
+      }, 1000)
+      : null;
 
     const streamId = aiMsg.id;
     let fullOutput = '';
     let responseStarted = false;
     let finished = false;
-    const previewState = createStreamingPreviewState(19);
-    renderThinkingLogLines(bodyEl.querySelector('.thinking-log'), updateStreamingPreviewLines(previewState, ''));
+    let exitCode = null;
+    let latestSections = null;
+    let lastSectionsParsedAt = 0;
+    const previewState = createStreamingPreviewState(
+      SHOW_STREAMING_WORK_PANEL ? 19 : STREAM_INLINE_PROGRESS_HISTORY_LIMIT
+    );
+    if (SHOW_STREAMING_WORK_PANEL) {
+      renderThinkingLogLines(bodyEl.querySelector('.thinking-log'), updateStreamingPreviewLines(previewState, ''));
+    }
+    const scheduleStreamRender = createThrottledInvoker(STREAM_RENDER_THROTTLE_MS, () => {
+      if (finished || convId !== activeConvId) return;
+      const now = Date.now();
+      if (!latestSections || now - lastSectionsParsedAt >= STREAM_SECTIONS_PARSE_INTERVAL_MS) {
+        latestSections = parseCodexOutput(fullOutput);
+        lastSectionsParsedAt = now;
+        updateCodexRuntimeInfo(latestSections);
+        updateCodexStatusbar(latestSections);
+      }
+      const sections = latestSections;
+      const hasContent = !!sections && Object.values(sections).some(s => s.content);
+      if (!responseStarted && hasContent) {
+        responseStarted = true;
+        if (elapsedTimer) clearInterval(elapsedTimer);
+      }
+      if (SHOW_STREAMING_WORK_PANEL) {
+        const logEl = bodyEl.querySelector('.thinking-log');
+        renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput, sections));
+        scrollToBottom();
+      } else {
+        const progressLines = updateStreamingPreviewLines(previewState, fullOutput, sections);
+        const previewResponse = String(sections?.response?.content || '').trim();
+        renderStreamingResponsePreview(bodyEl, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+        scrollToBottom();
+      }
+    });
 
     // 대화별 스트리밍 상태 등록
     const streamState = { streamId, elapsedTimer };
@@ -4641,36 +6601,35 @@
 
     const unsubStream = window.electronAPI.cli.onStream(({ id, chunk }) => {
       if (id !== streamId || finished) return;
-      fullOutput += chunk;
+      fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
       autoSaveIfNeeded();
 
       // 스트리밍 중 세션 ID 조기 캡처
       if (!conv.codexSessionId) {
-        const earlysections = parseCodexOutput(fullOutput);
-        const sid = extractCodexSessionId(earlysections);
+        const sid = extractCodexSessionIdFromText(fullOutput);
         if (sid) conv.codexSessionId = sid;
       }
 
-      if (convId !== activeConvId) return;
-
-      const sections = parseCodexOutput(fullOutput);
-      updateCodexRuntimeInfo(sections);
-      updateCodexStatusbar(sections);
-      const hasContent = Object.values(sections).some(s => s.content);
-
-      if (!responseStarted && hasContent) {
-        responseStarted = true;
-        clearInterval(elapsedTimer);
+      if (convId === activeConvId) {
+        const fastLines = updateStreamingPreviewFromChunk(previewState, chunk);
+        if (SHOW_STREAMING_WORK_PANEL) {
+          const logEl = bodyEl.querySelector('.thinking-log');
+          renderThinkingLogLines(logEl, fastLines);
+          scrollToBottom();
+        } else {
+          const previewResponse = String(latestSections?.response?.content || '').trim();
+          renderStreamingResponsePreview(bodyEl, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+          scrollToBottom();
+        }
       }
 
-      const logEl = bodyEl.querySelector('.thinking-log');
-      renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput));
-      scrollToBottom();
+      scheduleStreamRender();
     });
 
-    const unsubDone = window.electronAPI.cli.onDone(({ id }) => {
+    const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
       if (id !== streamId) return;
+      exitCode = Number.isFinite(Number(code)) ? Number(code) : null;
       finishStream();
     });
 
@@ -4680,11 +6639,21 @@
     function finishStream() {
       if (finished) return;
       finished = true;
+      scheduleStreamRender.cancel();
 
-      clearInterval(elapsedTimer);
+      if (elapsedTimer) clearInterval(elapsedTimer);
       convStreams.delete(convId);
       unsubStream();
       unsubDone();
+
+      if (!String(aiMsg.content || '').trim()) {
+        if (exitCode != null && exitCode !== 0) {
+          aiMsg.role = 'error';
+          aiMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
+        } else {
+          aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
+        }
+      }
 
       // 세션 ID 추출 후 대화에 저장
       const finalSections = parseCodexOutput(aiMsg.content || '');
@@ -4808,23 +6777,27 @@
     aiEl.classList.add('streaming');
 
     const bodyEl = aiEl.querySelector('.msg-body');
-    bodyEl.innerHTML = `<div class="thinking-indicator">
+    bodyEl.innerHTML = SHOW_STREAMING_WORK_PANEL
+      ? `<div class="thinking-indicator">
       <div class="thinking-header">
         <div class="thinking-dots"><span></span><span></span><span></span></div>
         <span class="thinking-text">${profile.name} 작업 중...</span>
         <span class="thinking-elapsed">0초</span>
       </div>
       <div class="thinking-log"></div>
-    </div>`;
+    </div>`
+      : '';
     scrollToBottom();
 
     const startTime = Date.now();
-    const elapsedEl = bodyEl.querySelector('.thinking-elapsed');
-    const elapsedTimer = setInterval(() => {
-      if (!elapsedEl) return;
-      const sec = Math.floor((Date.now() - startTime) / 1000);
-      elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
-    }, 1000);
+    const elapsedTimer = SHOW_STREAMING_WORK_PANEL
+      ? setInterval(() => {
+        const elapsedEl = bodyEl.querySelector('.thinking-elapsed');
+        if (!elapsedEl) return;
+        const sec = Math.floor((Date.now() - startTime) / 1000);
+        elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
+      }, 1000)
+      : null;
 
     const streamId = aiMsg.id;
 
@@ -4846,42 +6819,75 @@
     let fullOutput = '';
     let responseStarted = false;
     let finished = false;
-    const previewState = createStreamingPreviewState(19);
-    renderThinkingLogLines(bodyEl.querySelector('.thinking-log'), updateStreamingPreviewLines(previewState, ''));
+    let exitCode = null;
+    let latestSections = null;
+    let lastSectionsParsedAt = 0;
+    const previewState = createStreamingPreviewState(
+      SHOW_STREAMING_WORK_PANEL ? 19 : STREAM_INLINE_PROGRESS_HISTORY_LIMIT
+    );
+    if (SHOW_STREAMING_WORK_PANEL) {
+      renderThinkingLogLines(bodyEl.querySelector('.thinking-log'), updateStreamingPreviewLines(previewState, ''));
+    }
+    const scheduleStreamRender = createThrottledInvoker(STREAM_RENDER_THROTTLE_MS, () => {
+      if (finished || convId !== activeConvId) return;
+      const now = Date.now();
+      if (!latestSections || now - lastSectionsParsedAt >= STREAM_SECTIONS_PARSE_INTERVAL_MS) {
+        latestSections = parseCodexOutput(fullOutput);
+        lastSectionsParsedAt = now;
+        updateCodexRuntimeInfo(latestSections);
+        updateCodexStatusbar(latestSections);
+      }
+      const sections = latestSections;
+      const hasContent = !!sections && Object.values(sections).some(s => s.content);
+
+      if (!responseStarted && hasContent) {
+        responseStarted = true;
+        if (elapsedTimer) clearInterval(elapsedTimer);
+      }
+      if (SHOW_STREAMING_WORK_PANEL) {
+        const logEl = bodyEl.querySelector('.thinking-log');
+        renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput, sections));
+        scrollToBottom();
+      } else {
+        const progressLines = updateStreamingPreviewLines(previewState, fullOutput, sections);
+        const previewResponse = String(sections?.response?.content || '').trim();
+        renderStreamingResponsePreview(bodyEl, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+        scrollToBottom();
+      }
+    });
 
     const unsubStream = window.electronAPI.cli.onStream(({ id, chunk }) => {
       if (id !== streamId || finished) return;
-      fullOutput += chunk;
+      fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
       autoSaveIfNeeded();
 
       // 스트리밍 중 세션 ID 조기 캡처
       if (!conv.codexSessionId) {
-        const earlySections = parseCodexOutput(fullOutput);
-        const sid = extractCodexSessionId(earlySections);
+        const sid = extractCodexSessionIdFromText(fullOutput);
         if (sid) conv.codexSessionId = sid;
       }
 
-      // 현재 보고있는 대화가 아니면 DOM 업데이트 스킵 (데이터만 저장)
-      if (convId !== activeConvId) return;
-
-      const sections = parseCodexOutput(fullOutput);
-      updateCodexRuntimeInfo(sections);
-      updateCodexStatusbar(sections);
-      const hasContent = Object.values(sections).some(s => s.content);
-
-      if (!responseStarted && hasContent) {
-        responseStarted = true;
-        clearInterval(elapsedTimer);
+      if (convId === activeConvId) {
+        const fastLines = updateStreamingPreviewFromChunk(previewState, chunk);
+        if (SHOW_STREAMING_WORK_PANEL) {
+          const logEl = bodyEl.querySelector('.thinking-log');
+          renderThinkingLogLines(logEl, fastLines);
+          scrollToBottom();
+        } else {
+          const previewResponse = String(latestSections?.response?.content || '').trim();
+          renderStreamingResponsePreview(bodyEl, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+          scrollToBottom();
+        }
       }
 
-      const logEl = bodyEl.querySelector('.thinking-log');
-      renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput));
-      scrollToBottom();
+      // 현재 보고있는 대화가 아니면 DOM 업데이트 스킵 (데이터만 저장)
+      scheduleStreamRender();
     });
 
-    const unsubDone = window.electronAPI.cli.onDone(({ id }) => {
+    const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
       if (id !== streamId) return;
+      exitCode = Number.isFinite(Number(code)) ? Number(code) : null;
       finishStream();
     });
 
@@ -4901,14 +6907,24 @@
     function finishStream() {
       if (finished) return;
       finished = true;
+      scheduleStreamRender.cancel();
 
-      clearInterval(elapsedTimer);
+      if (elapsedTimer) clearInterval(elapsedTimer);
       convStreams.delete(convId);
 
       // 리스너 즉시 해제 (다른 프로세스 이벤트가 이 핸들러에 도달하지 않도록)
       unsubStream();
       unsubDone();
       unsubError();
+
+      if (!String(aiMsg.content || '').trim()) {
+        if (exitCode != null && exitCode !== 0) {
+          aiMsg.role = 'error';
+          aiMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
+        } else {
+          aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
+        }
+      }
 
       // 세션 ID 추출 후 대화에 저장
       const finalSections = parseCodexOutput(aiMsg.content || '');
@@ -5144,6 +7160,19 @@
     renderHistory();
     syncStreamingUI();
   });
+
+  if ($btnUserManual) {
+    $btnUserManual.addEventListener('click', async () => {
+      try {
+        const result = await window.electronAPI.help.openManual();
+        if (!result?.success) {
+          showSlashFeedback(result?.error || '사용 설명서를 열지 못했습니다.', true);
+        }
+      } catch (err) {
+        showSlashFeedback(err?.message || '사용 설명서를 열지 못했습니다.', true);
+      }
+    });
+  }
 
   // 힌트 칩 클릭
   document.querySelectorAll('.hint-chip').forEach(chip => {
