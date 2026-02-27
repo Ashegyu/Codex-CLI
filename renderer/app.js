@@ -1322,12 +1322,22 @@
   let sessionPickerSelectedIndex = 0;
   let sessionPickerItems = [];
   let sessionPickerRestoreMode = 'default'; // default | raw
+  let sessionPickerLastCodexListError = '';
 
   function parseSessionTime(value) {
     if (typeof value === 'number' && Number.isFinite(value)) return value;
     if (typeof value !== 'string' || !value) return 0;
     const t = Date.parse(value);
     return Number.isFinite(t) ? t : 0;
+  }
+
+  function normalizeSessionCwd(value) {
+    const raw = String(value || '').trim();
+    if (!raw) return '';
+    return raw
+      .replace(/\//g, '\\')
+      .replace(/[\\]+$/, '')
+      .toLowerCase();
   }
 
   function normalizeSessionDescription(text, maxLen = 140) {
@@ -1444,15 +1454,29 @@
           timestamp: Number.isFinite(lastTs) ? lastTs : 0,
           source: 'saved',
           filePath: '',
+          hasSaved: true,
+          hasCodex: false,
+          savedCount: 1,
         };
       });
   }
 
-  async function getCodexSessionItems(limit = 80) {
+  async function getCodexSessionItems(limit = 80, options = {}) {
     try {
       if (!window.electronAPI?.codex?.listSessions) return [];
-      const result = await window.electronAPI.codex.listSessions(limit);
-      if (!result?.success || !Array.isArray(result.data)) return [];
+      const request = {
+        limit,
+        cwd: typeof options.cwd === 'string' ? options.cwd : '',
+        includeAll: options.includeAll === true,
+      };
+      const result = await window.electronAPI.codex.listSessions(request);
+      if (!result?.success) {
+        sessionPickerLastCodexListError = String(result?.error || 'unknown');
+        console.error('[session-picker] codex:listSessions failed:', sessionPickerLastCodexListError);
+        return [];
+      }
+      sessionPickerLastCodexListError = '';
+      if (!Array.isArray(result.data)) return [];
       return result.data
         .map((item) => {
           const sid = typeof item?.id === 'string' ? item.id : '';
@@ -1469,22 +1493,40 @@
             timestamp: startedAtMs || updatedAtMs,
             source: 'codex',
             filePath: typeof item?.filePath === 'string' ? item.filePath : '',
+            hasSaved: false,
+            hasCodex: true,
+            savedCount: 0,
           };
         })
         .filter(Boolean);
-    } catch {
+    } catch (err) {
+      sessionPickerLastCodexListError = String(err?.message || err || 'unknown');
+      console.error('[session-picker] codex:listSessions exception:', err);
       return [];
     }
   }
 
   async function buildSessionPickerItems() {
     const merged = new Map();
-    const codexItems = await getCodexSessionItems(120);
+    const currentCwdKey = normalizeSessionCwd(currentCwd);
+    const codexItems = await getCodexSessionItems(1000, {
+      cwd: currentCwd,
+      includeAll: false,
+    });
     for (const item of codexItems) {
+      if (currentCwdKey) {
+        const itemCwdKey = normalizeSessionCwd(item.cwd);
+        if (!itemCwdKey || itemCwdKey !== currentCwdKey) continue;
+      }
       merged.set(item.sessionId, item);
     }
 
-    const savedItems = getSavedSessionItems();
+    const savedItems = getSavedSessionItems().filter((item) => {
+      if (!currentCwdKey) return true;
+      const itemCwdKey = normalizeSessionCwd(item.cwd);
+      if (!itemCwdKey) return false;
+      return itemCwdKey === currentCwdKey;
+    });
     for (const item of savedItems) {
       const existing = merged.get(item.sessionId);
       if (!existing) {
@@ -1498,12 +1540,133 @@
         description: item.description || existing.description,
         cwd: item.cwd || existing.cwd,
         timestamp: Math.max(existing.timestamp || 0, item.timestamp || 0),
-        source: 'saved',
+        source: (item.hasSaved || existing.hasSaved) ? 'saved' : 'codex',
         filePath: existing.filePath || '',
+        hasSaved: !!item.hasSaved || !!existing.hasSaved,
+        hasCodex: !!item.hasCodex || !!existing.hasCodex,
+        savedCount: (Number(existing.savedCount) || 0) + (Number(item.savedCount) || 0),
       });
     }
 
     return Array.from(merged.values()).sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  }
+
+  function getSessionItemSourceLabel(item) {
+    const labels = [];
+    if (item?.hasSaved) {
+      const savedCount = Math.max(1, Number(item?.savedCount) || 0);
+      labels.push(`앱 저장 ${savedCount}개`);
+    }
+    if (item?.hasCodex) labels.push('Codex 기록');
+    return labels.length > 0 ? labels.join(' + ') : '알 수 없음';
+  }
+
+  function renderSessionPickerEmpty(detail = '') {
+    if (!$sessionPicker) return;
+    const detailHtml = detail
+      ? `<div class="session-picker-error">${escapeHtml(detail)}</div>`
+      : '';
+    $sessionPicker.innerHTML = `
+      <div class="session-picker-header">
+        <span>세션 목록 ${sessionPickerRestoreMode === 'raw' ? '(원본 로그)' : '(일반)'}</span>
+        <button class="session-picker-close" type="button">&times;</button>
+      </div>
+      <div class="session-picker-empty">저장된/Codex 세션이 없습니다.</div>
+      ${detailHtml}`;
+    $sessionPicker.classList.remove('hidden');
+    $sessionPicker.querySelector('.session-picker-close').addEventListener('click', hideSessionPicker);
+  }
+
+  function removeSavedSessionConversationsBySessionId(sessionId) {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return 0;
+
+    const remain = [];
+    let removed = 0;
+    let removedActive = false;
+    for (const conv of conversations) {
+      if (conv && conv.codexSessionId === sid) {
+        removed += 1;
+        if (conv.id === activeConvId) removedActive = true;
+        if (historyEditingId === conv.id) historyEditingId = null;
+        continue;
+      }
+      remain.push(conv);
+    }
+    if (removed <= 0) return 0;
+
+    conversations = remain;
+    if (removedActive) {
+      activeConvId = conversations.length > 0 ? conversations[0].id : null;
+    }
+
+    saveConversations();
+    renderMessages();
+    renderHistory();
+    return removed;
+  }
+
+  async function reloadSessionPickerItems() {
+    sessionPickerItems = await buildSessionPickerItems();
+    if (sessionPickerItems.length === 0) {
+      sessionPickerSelectedIndex = 0;
+      renderSessionPickerEmpty();
+      return;
+    }
+    if (sessionPickerSelectedIndex >= sessionPickerItems.length) {
+      sessionPickerSelectedIndex = sessionPickerItems.length - 1;
+    }
+    if (sessionPickerSelectedIndex < 0) sessionPickerSelectedIndex = 0;
+    renderSessionPickerItems();
+  }
+
+  async function deleteSessionPickerItem(item, target) {
+    if (!item || !item.sessionId) return;
+    const sid = item.sessionId;
+
+    if (target === 'saved') {
+      if (!item.hasSaved) {
+        showSlashFeedback(`앱 저장 데이터가 없습니다: ${sid}`, true);
+        return;
+      }
+      const savedCount = Math.max(1, Number(item.savedCount) || 0);
+      const confirmed = window.confirm(`앱 저장 대화 ${savedCount}개를 삭제할까요?\nsession-id: ${sid}\n이 작업은 되돌릴 수 없습니다.`);
+      if (!confirmed) return;
+
+      const removedCount = removeSavedSessionConversationsBySessionId(sid);
+      if (removedCount <= 0) {
+        showSlashFeedback(`삭제할 앱 저장 대화가 없습니다: ${sid}`, true);
+        return;
+      }
+      showSlashFeedback(`앱 저장 대화 ${removedCount}개를 삭제했습니다: ${sid}`, false);
+      await reloadSessionPickerItems();
+      return;
+    }
+
+    if (target === 'codex') {
+      if (!item.hasCodex) {
+        showSlashFeedback(`Codex 기록이 없습니다: ${sid}`, true);
+        return;
+      }
+      if (!window.electronAPI?.codex?.deleteSession) {
+        showSlashFeedback('Codex 세션 삭제 기능을 사용할 수 없습니다.', true);
+        return;
+      }
+      const confirmed = window.confirm(`Codex 원본 세션 로그를 삭제할까요?\nsession-id: ${sid}\n이 작업은 되돌릴 수 없습니다.`);
+      if (!confirmed) return;
+
+      const result = await window.electronAPI.codex.deleteSession({
+        sessionId: sid,
+        filePath: item.filePath || '',
+      });
+      if (!result?.success) {
+        showSlashFeedback(`Codex 세션 삭제 실패: ${result?.error || '알 수 없는 오류'}`, true);
+        return;
+      }
+
+      showSlashFeedback(`Codex 세션 로그를 삭제했습니다: ${sid}`, false);
+      await reloadSessionPickerItems();
+    }
   }
 
   async function applySessionPickerItem(item, restoreMode = sessionPickerRestoreMode) {
@@ -1564,16 +1727,15 @@
     sessionPickerRestoreMode = restoreMode === 'raw' ? 'raw' : 'default';
 
     sessionPickerItems = await buildSessionPickerItems();
+    if (sessionPickerLastCodexListError) {
+      showSlashFeedback(`Codex 세션 목록 로딩 실패: ${sessionPickerLastCodexListError}`, true);
+    }
 
     if (sessionPickerItems.length === 0) {
-      $sessionPicker.innerHTML = `
-        <div class="session-picker-header">
-          <span>세션 목록 ${sessionPickerRestoreMode === 'raw' ? '(원본 로그)' : '(일반)'}</span>
-          <button class="session-picker-close" type="button">&times;</button>
-        </div>
-        <div class="session-picker-empty">저장된/Codex 세션이 없습니다.</div>`;
-      $sessionPicker.classList.remove('hidden');
-      $sessionPicker.querySelector('.session-picker-close').addEventListener('click', hideSessionPicker);
+      const detail = sessionPickerLastCodexListError
+        ? `Codex 세션 목록 로딩 실패: ${sessionPickerLastCodexListError}`
+        : '';
+      renderSessionPickerEmpty(detail);
       return;
     }
 
@@ -1589,15 +1751,27 @@
       const title = item.title || '(제목 없음)';
       const description = item.description || '';
       const sid = item.sessionId || '';
-      const sourceLabel = item.source === 'saved' ? '앱 저장' : 'Codex 기록';
-      return `<button type="button" class="session-picker-item ${idx === sessionPickerSelectedIndex ? 'active' : ''}" data-index="${idx}" data-session-id="${sid}">
-        <span class="session-picker-title">${escapeHtml(title)}</span>
-        ${description ? `<span class="session-picker-desc">${escapeHtml(description)}</span>` : ''}
-        <span class="session-picker-meta">
-          <span class="session-picker-id">${escapeHtml(sid)}</span>
-          <span class="session-picker-submeta"><span>${escapeHtml(sourceLabel)}</span><span>${escapeHtml(date)}</span></span>
-        </span>
-      </button>`;
+      const sourceLabel = getSessionItemSourceLabel(item);
+      const deleteButtons = [
+        item.hasSaved
+          ? `<button type="button" class="session-picker-delete-btn" data-index="${idx}" data-delete-target="saved" title="앱 저장 대화 삭제">앱</button>`
+          : '',
+        item.hasCodex
+          ? `<button type="button" class="session-picker-delete-btn" data-index="${idx}" data-delete-target="codex" title="Codex 원본 로그 삭제">Codex</button>`
+          : '',
+      ].filter(Boolean).join('');
+
+      return `<div class="session-picker-row ${idx === sessionPickerSelectedIndex ? 'active' : ''}" data-index="${idx}">
+        <button type="button" class="session-picker-item ${idx === sessionPickerSelectedIndex ? 'active' : ''}" data-index="${idx}" data-session-id="${sid}">
+          <span class="session-picker-title">${escapeHtml(title)}</span>
+          ${description ? `<span class="session-picker-desc">${escapeHtml(description)}</span>` : ''}
+          <span class="session-picker-meta">
+            <span class="session-picker-id">${escapeHtml(sid)}</span>
+            <span class="session-picker-submeta"><span>${escapeHtml(sourceLabel)}</span><span>${escapeHtml(date)}</span></span>
+          </span>
+        </button>
+        ${deleteButtons ? `<div class="session-picker-actions">${deleteButtons}</div>` : ''}
+      </div>`;
     }).join('');
 
     $sessionPicker.innerHTML = `
@@ -1616,6 +1790,19 @@
         const selected = Number.isFinite(idx) ? sessionPickerItems[idx] : null;
         hideSessionPicker();
         if (selected) void applySessionPickerItem(selected, sessionPickerRestoreMode);
+      });
+    });
+
+    $sessionPicker.querySelectorAll('.session-picker-delete-btn').forEach(el => {
+      el.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        const idx = Number(el.dataset.index);
+        const selected = Number.isFinite(idx) ? sessionPickerItems[idx] : null;
+        const target = String(el.dataset.deleteTarget || '');
+        if (selected && (target === 'saved' || target === 'codex')) {
+          void deleteSessionPickerItem(selected, target);
+        }
       });
     });
   }
@@ -6443,11 +6630,10 @@
       saveConversations();
     }
 
-    // CLI 실행 — 서브커맨드용 인자 구성
-    const skipGitCheck = ['resume', 'fork'].includes(subcommand) ? [] : ['--skip-git-repo-check'];
+    // CLI 실행 — 서브커맨드 인자는 그대로 전달한다.
     const cliArgs = subcommand === '--version'
       ? ['--version']
-      : [subcommand, ...skipGitCheck, ...extraArgs];
+      : [subcommand, ...extraArgs];
 
     try {
       const runResult = await window.electronAPI.cli.run({

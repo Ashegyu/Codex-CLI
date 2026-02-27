@@ -1,8 +1,8 @@
 version: 1.0.0
 files:
   - url: CLI-Chat-Setup-1.0.0.exe
-    sha512: 2MaiPLJbpIpq1GP7P1E0qRgm1XiOSHBkm6ZLeELO3dypKnKvEP2D5MoHKkZ0etDa1O71C4NIWr9isv309zYDMA==
-    size: 86461349
+    sha512: Kk+sBcToyXuOGX410Eu8qSNHX8zLX71drNeZbzyNHzBeROcjYyTBRTm9rY2Q6AaKqdUhoBB/vF6VVnt4uRDCWQ==
+    size: 86463006
 path: CLI-Chat-Setup-1.0.0.exe
-sha512: 2MaiPLJbpIpq1GP7P1E0qRgm1XiOSHBkm6ZLeELO3dypKnKvEP2D5MoHKkZ0etDa1O71C4NIWr9isv309zYDMA==
-releaseDate: '2026-02-27T02:42:31.973Z'
+sha512: Kk+sBcToyXuOGX410Eu8qSNHX8zLX71drNeZbzyNHzBeROcjYyTBRTm9rY2Q6AaKqdUhoBB/vF6VVnt4uRDCWQ==
+releaseDate: '2026-02-27T04:41:43.845Z'

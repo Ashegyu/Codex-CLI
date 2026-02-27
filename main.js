@@ -794,102 +794,96 @@ ipcMain.handle('help:openManual', () => {
 });
 
 // --- Codex rate_limits 읽기 (세션 JSONL에서) ---
+function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
+  const size = Number(fileSize);
+  if (!Number.isFinite(size) || size <= 0) return null;
+
+  // 파일 전체를 읽으면 UI가 멈출 수 있으므로, tail만 단계적으로 읽어 마지막 rate_limits를 찾는다.
+  const chunkSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024]; // 256KB -> 1MB -> 4MB
+  for (const chunkSize of chunkSizes) {
+    const bytesToRead = Math.min(size, chunkSize);
+    const start = Math.max(0, size - bytesToRead);
+    let content = '';
+    let fd = null;
+    try {
+      fd = fs.openSync(filePath, 'r');
+      const buffer = Buffer.alloc(bytesToRead);
+      fs.readSync(fd, buffer, 0, bytesToRead, start);
+      content = buffer.toString('utf8');
+    } catch {
+      continue;
+    } finally {
+      if (typeof fd === 'number') {
+        try { fs.closeSync(fd); } catch { /* ignore */ }
+      }
+    }
+
+    const lines = content.split('\n').reverse();
+    for (const line of lines) {
+      if (!line || (!line.includes('rate_limits') && !line.includes('rateLimits'))) continue;
+      try {
+        const obj = JSON.parse(line);
+        const rl = obj?.payload?.rate_limits
+          || obj?.payload?.info?.rate_limits
+          || obj?.rate_limits
+          || null;
+        if (!rl || !rl.primary || !rl.secondary) continue;
+
+        const h5Used = Number(rl.primary.used_percent);
+        const weeklyUsed = Number(rl.secondary.used_percent);
+        if (!Number.isFinite(h5Used) || !Number.isFinite(weeklyUsed)) continue;
+
+        return {
+          success: true,
+          h5Used,
+          weeklyUsed,
+          h5Remaining: Math.max(0, 100 - h5Used),
+          weeklyRemaining: Math.max(0, 100 - weeklyUsed),
+          h5Window: rl.primary.window_minutes,
+          weeklyWindow: rl.secondary.window_minutes,
+          h5ResetsAt: rl.primary.resets_at,
+          weeklyResetsAt: rl.secondary.resets_at,
+        };
+      } catch {
+        // malformed json line
+      }
+    }
+  }
+
+  return null;
+}
+
 ipcMain.handle('codex:rateLimits', () => {
   try {
     const sessionsDir = path.join(os.homedir(), '.codex', 'sessions');
     if (!fs.existsSync(sessionsDir)) return { success: false, error: 'no sessions dir' };
 
-    // 최신 날짜 폴더 탐색 (YYYY/MM/DD)
-    const years = fs.readdirSync(sessionsDir).sort().reverse();
-    let latestFile = null;
-    let latestMtime = 0;
-
-    for (const year of years.slice(0, 2)) {
-      const yearDir = path.join(sessionsDir, year);
-      if (!fs.statSync(yearDir).isDirectory()) continue;
-      const months = fs.readdirSync(yearDir).sort().reverse();
-      for (const month of months.slice(0, 2)) {
-        const monthDir = path.join(yearDir, month);
-        if (!fs.statSync(monthDir).isDirectory()) continue;
-        const days = fs.readdirSync(monthDir).sort().reverse();
-        for (const day of days.slice(0, 2)) {
-          const dayDir = path.join(monthDir, day);
-          if (!fs.statSync(dayDir).isDirectory()) continue;
-          const files = fs.readdirSync(dayDir)
-            .filter(f => f.endsWith('.jsonl'))
-            .map(f => {
-              const fp = path.join(dayDir, f);
-              return { path: fp, mtime: fs.statSync(fp).mtimeMs };
-            })
-            .sort((a, b) => b.mtime - a.mtime);
-          if (files.length > 0 && files[0].mtime > latestMtime) {
-            latestFile = files[0].path;
-            latestMtime = files[0].mtime;
-          }
-        }
-        if (latestFile) break;
-      }
-      if (latestFile) break;
-    }
-
-    if (!latestFile) return { success: false, error: 'no session files' };
-    const latestStat = fs.statSync(latestFile);
     const now = Date.now();
+    const files = listCodexSessionFiles().slice(0, 40); // 최근 파일 우선 탐색
+    if (files.length === 0) return { success: false, error: 'no session files' };
+
+    // 캐시 대상 파일이 아직 최신 후보군에 있고 mtime이 유지되면 캐시 반환
     if (
       codexRateLimitCache.result &&
-      now - codexRateLimitCache.ts < 15000 &&
-      codexRateLimitCache.filePath === latestFile &&
-      codexRateLimitCache.fileMtime === latestStat.mtimeMs
+      now - codexRateLimitCache.ts < 15000
     ) {
-      return codexRateLimitCache.result;
+      const cachedFile = files.find(file => file.filePath === codexRateLimitCache.filePath);
+      if (cachedFile && cachedFile.mtimeMs === codexRateLimitCache.fileMtime) {
+        return codexRateLimitCache.result;
+      }
     }
 
-    // 파일 전체를 읽으면 UI가 멈출 수 있으므로, 파일 tail만 단계적으로 읽어 마지막 rate_limits를 찾는다.
-    const stat = latestStat;
-    if (!stat.isFile() || stat.size <= 0) return { success: false, error: 'empty session file' };
+    for (const file of files) {
+      const resolved = parseCodexRateLimitsFromSessionFile(file.filePath, file.size);
+      if (!resolved) continue;
 
-    const chunkSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024]; // 256KB -> 1MB -> 4MB
-    for (const chunkSize of chunkSizes) {
-      const bytesToRead = Math.min(stat.size, chunkSize);
-      const start = Math.max(0, stat.size - bytesToRead);
-      const fd = fs.openSync(latestFile, 'r');
-      let content = '';
-      try {
-        const buffer = Buffer.alloc(bytesToRead);
-        fs.readSync(fd, buffer, 0, bytesToRead, start);
-        content = buffer.toString('utf8');
-      } finally {
-        fs.closeSync(fd);
-      }
-
-      const lines = content.split('\n').reverse();
-      for (const line of lines) {
-        if (!line || !line.includes('rate_limits')) continue;
-        try {
-          const obj = JSON.parse(line);
-          const rl = obj?.payload?.rate_limits;
-          if (rl && rl.primary && rl.secondary) {
-            const resolved = {
-              success: true,
-              h5Used: rl.primary.used_percent,
-              weeklyUsed: rl.secondary.used_percent,
-              h5Remaining: Math.max(0, 100 - rl.primary.used_percent),
-              weeklyRemaining: Math.max(0, 100 - rl.secondary.used_percent),
-              h5Window: rl.primary.window_minutes,
-              weeklyWindow: rl.secondary.window_minutes,
-              h5ResetsAt: rl.primary.resets_at,
-              weeklyResetsAt: rl.secondary.resets_at,
-            };
-            codexRateLimitCache = {
-              ts: now,
-              filePath: latestFile,
-              fileMtime: stat.mtimeMs,
-              result: resolved,
-            };
-            return resolved;
-          }
-        } catch { /* malformed json line */ }
-      }
+      codexRateLimitCache = {
+        ts: now,
+        filePath: file.filePath,
+        fileMtime: file.mtimeMs,
+        result: resolved,
+      };
+      return resolved;
     }
 
     return { success: false, error: 'no rate_limits found' };
@@ -907,25 +901,76 @@ function listCodexSessionFiles() {
   if (!fs.existsSync(sessionsDir)) return [];
 
   const files = [];
-  const years = fs.readdirSync(sessionsDir).sort().reverse();
+  let years = [];
+  try {
+    years = fs.readdirSync(sessionsDir).sort().reverse();
+  } catch {
+    return [];
+  }
   for (const year of years) {
     const yearDir = path.join(sessionsDir, year);
-    if (!fs.existsSync(yearDir) || !fs.statSync(yearDir).isDirectory()) continue;
-    const months = fs.readdirSync(yearDir).sort().reverse();
+    let yearStat;
+    try {
+      if (!fs.existsSync(yearDir)) continue;
+      yearStat = fs.statSync(yearDir);
+    } catch {
+      continue;
+    }
+    if (!yearStat.isDirectory()) continue;
+
+    let months = [];
+    try {
+      months = fs.readdirSync(yearDir).sort().reverse();
+    } catch {
+      continue;
+    }
     for (const month of months) {
       const monthDir = path.join(yearDir, month);
-      if (!fs.existsSync(monthDir) || !fs.statSync(monthDir).isDirectory()) continue;
-      const days = fs.readdirSync(monthDir).sort().reverse();
+      let monthStat;
+      try {
+        if (!fs.existsSync(monthDir)) continue;
+        monthStat = fs.statSync(monthDir);
+      } catch {
+        continue;
+      }
+      if (!monthStat.isDirectory()) continue;
+
+      let days = [];
+      try {
+        days = fs.readdirSync(monthDir).sort().reverse();
+      } catch {
+        continue;
+      }
       for (const day of days) {
         const dayDir = path.join(monthDir, day);
-        if (!fs.existsSync(dayDir) || !fs.statSync(dayDir).isDirectory()) continue;
-        const dayFiles = fs.readdirSync(dayDir)
-          .filter(name => name.endsWith('.jsonl'))
-          .map(name => {
-            const filePath = path.join(dayDir, name);
+        let dayStat;
+        try {
+          if (!fs.existsSync(dayDir)) continue;
+          dayStat = fs.statSync(dayDir);
+        } catch {
+          continue;
+        }
+        if (!dayStat.isDirectory()) continue;
+
+        let names = [];
+        try {
+          names = fs.readdirSync(dayDir);
+        } catch {
+          continue;
+        }
+
+        const dayFiles = [];
+        for (const name of names) {
+          if (!name.endsWith('.jsonl')) continue;
+          const filePath = path.join(dayDir, name);
+          try {
             const stat = fs.statSync(filePath);
-            return { filePath, name, mtimeMs: stat.mtimeMs, size: stat.size };
-          });
+            if (!stat.isFile()) continue;
+            dayFiles.push({ filePath, name, mtimeMs: stat.mtimeMs, size: stat.size });
+          } catch {
+            // 접근 불가/경합 파일은 건너뛴다.
+          }
+        }
         files.push(...dayFiles);
       }
     }
@@ -938,6 +983,33 @@ function normalizePreviewText(text, maxLen = 140) {
   const compact = String(text || '').replace(/\s+/g, ' ').trim();
   if (!compact) return '';
   return compact.length > maxLen ? `${compact.slice(0, maxLen - 3)}...` : compact;
+}
+
+function normalizeSessionCwd(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+  try {
+    return path.resolve(raw).replace(/[\\/]+$/, '').toLowerCase();
+  } catch {
+    return raw.replace(/\//g, '\\').replace(/[\\]+$/, '').toLowerCase();
+  }
+}
+
+function extractSessionIdFromFileName(fileName) {
+  const base = path.basename(String(fileName || ''), '.jsonl');
+  if (!base) return '';
+
+  // rollout-YYYY-MM-DDTHH-mm-ss-<session-id>.jsonl
+  const rolloutMatch = base.match(/^rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-(.+)$/i);
+  if (rolloutMatch && rolloutMatch[1]) return rolloutMatch[1];
+
+  const uuidMatch = base.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/i);
+  if (uuidMatch) return uuidMatch[1];
+
+  const genericTail = base.match(/-([a-z0-9][a-z0-9-]{7,})$/i);
+  if (genericTail) return genericTail[1];
+
+  return '';
 }
 
 function isIgnorableSessionUserText(text) {
@@ -1010,8 +1082,7 @@ function parseSessionPreview(filePath, fileSize, fileName) {
   }
 
   if (!sessionId) {
-    const m = fileName.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
-    if (m) sessionId = m[1];
+    sessionId = extractSessionIdFromFileName(fileName);
   }
 
   return { sessionId, cwd, startedAt, description };
@@ -1038,6 +1109,14 @@ function resolveCodexSessionFilePath(sessionId, preferredPath) {
     }
   }
   return '';
+}
+
+function isSubPath(parentDir, targetPath) {
+  const parent = path.resolve(parentDir);
+  const target = path.resolve(targetPath);
+  const relative = path.relative(parent, target);
+  if (!relative) return false;
+  return !relative.startsWith('..') && !path.isAbsolute(relative);
 }
 
 function parseCodexSessionConversation(filePath, options = {}) {
@@ -1100,8 +1179,7 @@ function parseCodexSessionConversation(filePath, options = {}) {
 
   if (!result.id) {
     const name = path.basename(filePath);
-    const m = name.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
-    if (m) result.id = m[1];
+    result.id = extractSessionIdFromFileName(name);
   }
 
   return result;
@@ -1110,10 +1188,17 @@ function parseCodexSessionConversation(filePath, options = {}) {
 // --- Codex 세션 목록 읽기 (~/.codex/sessions) ---
 ipcMain.handle('codex:listSessions', (event, limitArg) => {
   try {
-    const limitNum = Number(limitArg);
+    const request = (limitArg && typeof limitArg === 'object')
+      ? limitArg
+      : { limit: limitArg };
+
+    const limitNum = Number(request.limit);
     const limit = Number.isFinite(limitNum)
-      ? Math.min(200, Math.max(1, Math.floor(limitNum)))
+      ? Math.min(1000, Math.max(1, Math.floor(limitNum)))
       : 60;
+    const requestCwd = typeof request.cwd === 'string' ? request.cwd : '';
+    const includeAll = request.includeAll === true;
+    const normalizedRequestCwd = includeAll ? '' : normalizeSessionCwd(requestCwd);
 
     const files = listCodexSessionFiles();
     const limitedFiles = files.slice(0, limit * 3);
@@ -1123,6 +1208,10 @@ ipcMain.handle('codex:listSessions', (event, limitArg) => {
       const preview = parseSessionPreview(file.filePath, file.size, file.name);
       const sessionId = preview.sessionId;
       if (!sessionId || dedup.has(sessionId)) continue;
+      if (normalizedRequestCwd) {
+        const sessionCwd = normalizeSessionCwd(preview.cwd || '');
+        if (!sessionCwd || sessionCwd !== normalizedRequestCwd) continue;
+      }
 
       const title = `세션 ${sessionId.slice(0, 8)}`;
       dedup.set(sessionId, {
@@ -1177,6 +1266,44 @@ ipcMain.handle('codex:loadSession', (event, arg) => {
         filePath,
         mode: modeRaw ? 'raw' : 'default',
         messages: parsed.messages,
+      },
+    };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('codex:deleteSession', (event, arg) => {
+  try {
+    const sessionId = typeof arg === 'string'
+      ? arg.trim()
+      : typeof arg?.sessionId === 'string'
+        ? arg.sessionId.trim()
+        : '';
+    const preferredPath = typeof arg?.filePath === 'string' ? arg.filePath : '';
+
+    if (!sessionId) return { success: false, error: 'session id required' };
+
+    const filePath = resolveCodexSessionFilePath(sessionId, preferredPath);
+    if (!filePath) return { success: false, error: 'session file not found' };
+    if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+      return { success: false, error: 'session file not found' };
+    }
+
+    const sessionsDir = getCodexSessionsDir();
+    if (!isSubPath(sessionsDir, filePath)) {
+      return { success: false, error: 'invalid session file path' };
+    }
+    if (path.extname(filePath).toLowerCase() !== '.jsonl') {
+      return { success: false, error: 'invalid session file type' };
+    }
+
+    fs.unlinkSync(filePath);
+    return {
+      success: true,
+      data: {
+        id: sessionId,
+        filePath,
       },
     };
   } catch (err) {

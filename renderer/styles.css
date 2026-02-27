@@ -1647,11 +1647,21 @@ body.sidebar-resizing * {
   color: var(--text);
 }
 
+.session-picker-row {
+  display: flex;
+  align-items: stretch;
+  border-bottom: 1px solid var(--border);
+}
+
+.session-picker-row:last-child {
+  border-bottom: none;
+}
+
 .session-picker-item {
-  width: 100%;
+  flex: 1;
+  width: auto;
   text-align: left;
   border: none;
-  border-bottom: 1px solid var(--border);
   background: transparent;
   color: var(--text-secondary);
   padding: 8px 12px;
@@ -1661,14 +1671,35 @@ body.sidebar-resizing * {
   gap: 2px;
 }
 
-.session-picker-item:last-child {
-  border-bottom: none;
-}
-
 .session-picker-item:hover,
+.session-picker-row.active .session-picker-item,
 .session-picker-item.active {
   background: var(--bg-hover);
   color: var(--text);
+}
+
+.session-picker-actions {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 6px;
+  padding: 8px 8px 8px 0;
+}
+
+.session-picker-delete-btn {
+  border: 1px solid var(--border);
+  background: rgba(255, 255, 255, 0.03);
+  color: var(--text-muted);
+  border-radius: 7px;
+  font-size: 10.5px;
+  padding: 3px 8px;
+  cursor: pointer;
+  line-height: 1.2;
+}
+
+.session-picker-delete-btn:hover {
+  color: var(--text);
+  border-color: var(--accent);
 }
 
 .session-picker-title {
@@ -1713,6 +1744,18 @@ body.sidebar-resizing * {
   font-size: 12px;
   color: var(--text-muted);
   text-align: center;
+}
+
+.session-picker-error {
+  margin: 0 12px 12px;
+  padding: 8px 10px;
+  border: 1px solid #6A363E;
+  border-radius: 8px;
+  background: #3A2228;
+  color: #FFB2BF;
+  font-size: 11px;
+  line-height: 1.35;
+  word-break: break-word;
 }
 
 #slash-command-feedback {

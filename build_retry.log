@@ -1,0 +1,54 @@
+
+> cli-chat-app@1.0.0 build
+> electron-builder --win
+
+  • electron-builder  version=25.1.8 os=10.0.26200
+  • loaded configuration  file=package.json ("build" field)
+  • skipped dependencies rebuild  reason=npmRebuild is set to false
+  • packaging       platform=win32 arch=x64 electron=33.4.11 appOutDir=dist\win-unpacked
+  ⨯ Cannot spawn C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-bin\win\x64\app-builder.exe: Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:421:11)
+    at Object.spawn (node:child_process:763:9)
+    at spawn (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\cross-spawn\index.js:12:24)
+    at doSpawn (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:180:18)
+    at C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:386:28
+    at new Promise (<anonymous>)
+    at runCommand (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:385:12)
+    at executeAppBuilder (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:404:12)
+    at unpack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:201:5)
+    at ElectronFramework.prepareApplicationStageDirectory (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:154:5)
+    at WinPackager.doPack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:238:5)
+    at WinPackager.pack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:138:5)
+    at Packager.doBuild (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:459:9)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)
+    at Packager.build (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:393:31)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)  failedTask=build stackTrace=Error: Cannot spawn C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-bin\win\x64\app-builder.exe: Error: spawn EPERM
+    at ChildProcess.spawn (node:internal/child_process:421:11)
+    at Object.spawn (node:child_process:763:9)
+    at spawn (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\cross-spawn\index.js:12:24)
+    at doSpawn (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:180:18)
+    at C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:386:28
+    at new Promise (<anonymous>)
+    at runCommand (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:385:12)
+    at executeAppBuilder (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:404:12)
+    at unpack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:201:5)
+    at ElectronFramework.prepareApplicationStageDirectory (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:154:5)
+    at WinPackager.doPack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:238:5)
+    at WinPackager.pack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:138:5)
+    at Packager.doBuild (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:459:9)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)
+    at Packager.build (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:393:31)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)
+    at doSpawn (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:182:11)
+    at C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:386:28
+    at new Promise (<anonymous>)
+    at runCommand (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:385:12)
+    at executeAppBuilder (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\util.ts:404:12)
+    at unpack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:201:5)
+    at ElectronFramework.prepareApplicationStageDirectory (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\electron\ElectronFramework.ts:154:5)
+    at WinPackager.doPack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:238:5)
+    at WinPackager.pack (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\platformPackager.ts:138:5)
+    at Packager.doBuild (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:459:9)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)
+    at Packager.build (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\app-builder-lib\src\packager.ts:393:31)
+    at executeFinally (C:\Users\GC\Desktop\업무\JGKim\Claude CLI\node_modules\builder-util\src\promise.ts:12:14)
