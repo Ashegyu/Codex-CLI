@@ -228,7 +228,7 @@
 
   /**
    * JSONL 스트림 chunk에서 승인 요청 이벤트를 감지한다.
-   * Codex CLI가 --approval-policy 모드에서 출력하는 다양한 승인 요청 형식을 지원한다.
+   * Codex CLI의 수동 승인 모드(-a/--ask-for-approval)에서 출력하는 다양한 승인 요청 형식을 지원한다.
    * @param {string} chunk - 스트림 chunk 텍스트
    * @returns {object|null} 승인 요청 정보 또는 null
    */
@@ -1836,9 +1836,23 @@
     return schedule;
   }
 
+  function resolveCodexApprovalFlag(policy) {
+    const normalized = String(policy || '').trim().toLowerCase();
+    if (!normalized || normalized === 'auto-approve') return null;
+    if (normalized === 'on-failure-or-unsafe') return 'on-request';
+    if (normalized === 'unless-allow-listed') return 'untrusted';
+    if (normalized === 'always-prompt') return 'untrusted';
+    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') {
+      return normalized;
+    }
+    return 'on-request';
+  }
+
   function buildCodexArgs(sessionId) {
+    const globalArgs = [];
     const args = ['exec'];
-    if (sessionId) {
+    const isResume = !!sessionId;
+    if (isResume) {
       args.push('resume', sessionId);
     }
     args.push('--skip-git-repo-check');
@@ -1847,24 +1861,24 @@
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else if (approvalPolicy === 'auto-approve') {
       // 자동 승인: --full-auto
-      if (sandboxMode === 'read-only') {
+      if (!isResume && sandboxMode === 'read-only') {
         args.push('--full-auto', '--sandbox', 'read-only');
       } else {
         args.push('--full-auto');
       }
     } else {
-      // 수동 승인: --full-auto 없이 승인 정책 전달
-      if (approvalPolicy === 'on-failure-or-unsafe') {
-        args.push('--approval-policy', 'on-failure-or-unsafe');
-      } else if (approvalPolicy === 'unless-allow-listed') {
-        args.push('--approval-policy', 'unless-allow-listed');
-      } else {
-        // always-prompt
-        args.push('--approval-policy', 'unless-allow-listed');
+      // 수동 승인 정책
+      if (!isResume) {
+        // 최신 Codex CLI는 승인 정책을 글로벌 옵션(-a/--ask-for-approval)으로만 지원한다.
+        const approvalFlag = resolveCodexApprovalFlag(approvalPolicy);
+        if (approvalFlag) {
+          globalArgs.push('-a', approvalFlag);
+        }
+        if (sandboxMode === 'read-only') {
+          args.push('--sandbox', 'read-only');
+        }
       }
-      if (sandboxMode === 'read-only') {
-        args.push('--sandbox', 'read-only');
-      }
+      // resume에서는 sandbox 플래그를 전달하지 않고 CLI 세션 저장 값을 사용
     }
     args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
@@ -1876,7 +1890,7 @@
     } else {
       args.push('-c', 'model_reasoning_effort=xhigh');
     }
-    return args;
+    return [...globalArgs, ...args];
   }
 
   function mergeCodexExecArgsWithGlobalFlags(baseArgs, extraArgs) {
@@ -3141,6 +3155,31 @@
         saveSidebarPrefs();
       }
     });
+
+    /* -- Left-edge hover zone: reopen sidebar when mouse enters left 6px -- */
+    const hoverZone = document.createElement('div');
+    hoverZone.id = 'sidebar-hover-zone';
+    document.body.appendChild(hoverZone);
+    let hoverTimer = null;
+    hoverZone.addEventListener('mouseenter', () => {
+      if (!sidebarCollapsed) return;
+      hoverTimer = setTimeout(() => setSidebarCollapsed(false), 120);
+    });
+    hoverZone.addEventListener('mouseleave', () => {
+      if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    });
+
+    /* -- Click on dim backdrop closes sidebar -- */
+    const $main = document.getElementById('main');
+    if ($main) {
+      $main.addEventListener('click', (e) => {
+        if (sidebarCollapsed) return;
+        // Only close if clicking on the backdrop area (not sidebar itself)
+        const sidebar = document.getElementById('sidebar');
+        if (sidebar && sidebar.contains(e.target)) return;
+        setSidebarCollapsed(true);
+      });
+    }
   }
 
   function runInitStep(name, fn) {
@@ -3354,7 +3393,7 @@
 
         // 대화 선택
         const histItem = target.closest('.history-item');
-        if (histItem) { loadConversation(histItem.dataset.id); return; }
+        if (histItem) { loadConversation(histItem.dataset.id); setSidebarCollapsed(true); return; }
 
         // 이름 변경 시작
         const renameBtn = target.closest('.history-rename-btn');
