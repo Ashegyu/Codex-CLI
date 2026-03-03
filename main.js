@@ -872,9 +872,6 @@ function classifyRateLimitScope(rateLimits) {
   ) {
     return 'context-window';
   }
-  if (meta.includes('spark') || limitId.includes('bengalfox')) {
-    return 'spark';
-  }
   return 'unknown';
 }
 
@@ -905,8 +902,7 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
 
   // 최신 로그 기준 fallback 후보를 유지하되,
   // Context Window(codex) 항목을 찾으면 즉시 우선 반환한다.
-  let fallbackNonSpark = null;
-  let fallbackAny = null;
+  let fallback = null;
 
   // 파일 전체를 읽으면 UI가 멈출 수 있으므로, tail만 단계적으로 읽어 마지막 rate_limits를 찾는다.
   const chunkSizes = [256 * 1024, 1024 * 1024, 4 * 1024 * 1024]; // 256KB -> 1MB -> 4MB
@@ -940,11 +936,8 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
         const snapshot = toRateLimitSnapshot(rl);
         if (!snapshot) continue;
 
-        if (!fallbackAny) fallbackAny = snapshot;
+        if (!fallback) fallback = snapshot;
         const scope = classifyRateLimitScope(rl);
-        if (scope !== 'spark' && !fallbackNonSpark) {
-          fallbackNonSpark = snapshot;
-        }
         if (scope === 'context-window') {
           return snapshot;
         }
@@ -954,7 +947,7 @@ function parseCodexRateLimitsFromSessionFile(filePath, fileSize) {
     }
   }
 
-  return fallbackNonSpark || fallbackAny || null;
+  return fallback || null;
 }
 
 ipcMain.handle('codex:rateLimits', () => {

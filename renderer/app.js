@@ -591,6 +591,7 @@
   const $modelHint = document.getElementById('current-model-name');
   const $planModeHint = document.getElementById('current-plan-mode');
   const $sandboxHint = document.getElementById('current-sandbox-mode');
+  const $contextHint = document.getElementById('context-compress-hint');
   const $runtimeMenu = document.getElementById('runtime-selector-menu');
   const $slashMenu = document.getElementById('slash-command-menu');
   const $sessionPicker = document.getElementById('session-picker');
@@ -632,6 +633,9 @@
     { command: '/file', description: '파일 불러오기', usage: '/file [경로]' },
     { command: '/status', description: '5h/weekly limit 갱신', usage: '/status' },
     { command: '/clear', description: '현재 대화 초기화', usage: '/clear' },
+    { command: '/compress', description: '현재 대화 컨텍스트 압축', usage: '/compress' },
+    { command: '/concise', description: '간결 모드 토글 (토큰 절약)', usage: '/concise [on|off]' },
+    { command: '/context-limit', description: '자동 압축 메시지 수 설정', usage: '/context-limit [숫자]' },
     { command: '/features', description: 'Codex feature flag 목록', usage: '/features' },
     { command: '/version', description: 'Codex CLI 버전', usage: '/version' },
     { command: '/help', description: '명령어 목록', usage: '/help' },
@@ -648,7 +652,6 @@
   const DEFAULT_MODEL_ID = 'GPT-5.3-Codex';
   const DEFAULT_REASONING = 'extra high';
   const RUNTIME_INFO_VERSION = 3;
-  const CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS = 10 * 60 * 1000;
   const STREAM_RENDER_THROTTLE_MS = 70;
   const STREAM_SECTIONS_PARSE_INTERVAL_MS = 280;
   const SHOW_STREAMING_WORK_PANEL = false;
@@ -659,6 +662,146 @@
   let codexLimitSnapshot = loadCodexLimitSnapshot();
   let codexRuntimeInfo = loadCodexRuntimeInfo();
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
+
+  // === 컨텍스트 압축 설정 ===
+  const CONTEXT_COMPRESSION_KEY = 'contextCompressionEnabled';
+  const CONTEXT_MAX_MESSAGES_KEY = 'contextMaxMessages';
+  const CONCISE_MODE_KEY = 'conciseMode';
+  const CONTEXT_MAX_MESSAGES_DEFAULT = 20;
+  const CONTEXT_MAX_MESSAGES_MIN = 6;
+  const CONTEXT_MAX_MESSAGES_MAX = 100;
+  const CONTEXT_RECENT_KEEP = 4; // 압축 시 최근 N개 메시지는 원본 유지
+
+  let contextCompressionEnabled = localStorage.getItem(CONTEXT_COMPRESSION_KEY) !== 'false'; // 기본 ON
+  let contextMaxMessages = (() => {
+    const v = parseInt(localStorage.getItem(CONTEXT_MAX_MESSAGES_KEY) || '', 10);
+    return Number.isFinite(v) && v >= CONTEXT_MAX_MESSAGES_MIN ? Math.min(v, CONTEXT_MAX_MESSAGES_MAX) : CONTEXT_MAX_MESSAGES_DEFAULT;
+  })();
+  let conciseMode = localStorage.getItem(CONCISE_MODE_KEY) === 'true'; // 기본 OFF
+
+  function saveContextSettings() {
+    localStorage.setItem(CONTEXT_COMPRESSION_KEY, String(contextCompressionEnabled));
+    localStorage.setItem(CONTEXT_MAX_MESSAGES_KEY, String(contextMaxMessages));
+    localStorage.setItem(CONCISE_MODE_KEY, String(conciseMode));
+  }
+
+  /**
+   * 대화 메시지 목록을 압축하여 요약 문자열로 반환한다.
+   * 최근 CONTEXT_RECENT_KEEP개 메시지는 제외하고 나머지를 요약한다.
+   */
+  function compressConversationContext(messages, keepRecent) {
+    if (!messages || messages.length === 0) return { summary: '', keptMessages: [] };
+    const keep = typeof keepRecent === 'number' ? keepRecent : CONTEXT_RECENT_KEEP;
+    const relevant = messages.filter(m => (m.role === 'user' || m.role === 'ai') && m.content);
+    if (relevant.length <= keep) return { summary: '', keptMessages: relevant };
+
+    const oldMessages = relevant.slice(0, relevant.length - keep);
+    const keptMessages = relevant.slice(relevant.length - keep);
+    const parts = ['[이전 대화 요약 — 토큰 절약을 위해 압축됨]'];
+
+    for (const msg of oldMessages) {
+      const role = msg.role === 'user' ? '사용자' : 'AI';
+      const raw = String(msg.content || '').trim();
+      if (!raw) continue;
+      // 코드 블록, diff, 장문 응답을 축약
+      let text = raw;
+      // 코드 블록을 짧은 참조로 대체
+      text = text.replace(/```[\s\S]*?```/g, '[코드 블록 생략]');
+      // diff 헤더 제거
+      text = text.replace(/^(---|\+\+\+|@@).*$/gm, '');
+      // 연속 빈 줄 제거
+      text = text.replace(/\n{3,}/g, '\n\n');
+      // 각 메시지 최대 길이 제한
+      const maxLen = msg.role === 'user' ? 150 : 300;
+      if (text.length > maxLen) text = text.slice(0, maxLen) + '…';
+      parts.push(`${role}: ${text}`);
+    }
+    parts.push('[요약 끝]');
+    return { summary: parts.join('\n'), keptMessages };
+  }
+
+  /**
+   * 대화의 메시지 수가 임계값을 초과했는지 확인.
+   */
+  function shouldAutoCompress(conv) {
+    if (!contextCompressionEnabled) return false;
+    if (!conv || !conv.messages) return false;
+    const count = conv.messages.filter(m => m.role === 'user' || m.role === 'ai').length;
+    return count > contextMaxMessages;
+  }
+
+  /**
+   * 압축된 프롬프트를 생성한다.
+   * 이전 대화 요약 + 최근 메시지 문맥 + 새 프롬프트를 결합.
+   */
+  function buildCompressedPrompt(conv, newPrompt) {
+    const messages = (conv.messages || []).filter(m => (m.role === 'user' || m.role === 'ai') && m.content);
+    const { summary, keptMessages } = compressConversationContext(messages, CONTEXT_RECENT_KEEP);
+    const parts = [];
+
+    if (conciseMode) {
+      parts.push('[시스템 지시] 간결하게 답변하세요. 코드 예시는 핵심만, 불필요한 설명은 생략하세요.');
+    }
+    if (summary) {
+      parts.push(summary);
+    }
+    // 최근 메시지 컨텍스트 포함 (모델이 맥락을 유지하도록)
+    if (keptMessages.length > 0) {
+      parts.push('[최근 대화]');
+      for (const msg of keptMessages) {
+        const role = msg.role === 'user' ? '사용자' : 'AI';
+        const text = String(msg.content || '').trim();
+        // 최근 메시지도 너무 길면 뒤쪽을 자름
+        const maxLen = msg.role === 'user' ? 500 : 1500;
+        const display = text.length > maxLen ? text.slice(0, maxLen) + '…' : text;
+        parts.push(`${role}: ${display}`);
+      }
+      parts.push('[최근 대화 끝]');
+    }
+    parts.push(newPrompt);
+    return parts.join('\n\n');
+  }
+
+  /**
+   * 현재 대화의 메시지를 압축하고 대화 내 메시지를 정리한다.
+   * 기존 메시지를 압축 요약 1개 + 최근 메시지로 교체.
+   */
+  function compressCurrentConversation() {
+    const conv = getActiveConversation();
+    if (!conv || !conv.messages || conv.messages.length <= CONTEXT_RECENT_KEEP + 2) {
+      return { success: false, reason: '압축할 메시지가 부족합니다.' };
+    }
+
+    const before = conv.messages.length;
+    const { summary, keptMessages } = compressConversationContext(conv.messages, CONTEXT_RECENT_KEEP);
+    if (!summary) {
+      return { success: false, reason: '압축할 이전 메시지가 없습니다.' };
+    }
+
+    // 압축 요약을 시스템 메시지로 저장하고 최근 메시지만 유지
+    const compressedMsg = {
+      id: `msg_compress_${Date.now()}`,
+      role: 'ai',
+      content: `📋 **컨텍스트 압축 완료**\n\n이전 ${before - keptMessages.length}개 메시지가 요약으로 압축되었습니다.\n토큰 사용량이 절감됩니다.\n\n<details><summary>압축된 요약 보기</summary>\n\n${summary.replace(/</g, '&lt;').replace(/>/g, '&gt;')}\n\n</details>`,
+      profileId: 'codex',
+      timestamp: Date.now(),
+    };
+
+    conv.messages = [compressedMsg, ...keptMessages.map(m => {
+      const found = conv.messages.find(om => om.id === m.id);
+      return found || m;
+    })];
+    // 세션 ID 초기화 (새 세션으로 압축된 컨텍스트 전송)
+    conv.codexSessionId = null;
+    saveConversations();
+
+    return {
+      success: true,
+      beforeCount: before,
+      afterCount: conv.messages.length,
+      savedMessages: before - conv.messages.length,
+    };
+  }
 
   // === Codex 사용량 트래커 ===
   const codexUsage = {
@@ -1042,6 +1185,55 @@
     return changed;
   }
 
+  function buildLiveRateLimitSnapshot(rateLimits) {
+    const primary = rateLimits?.primary || {};
+    const secondary = rateLimits?.secondary || {};
+    const h5Used = Number(primary.used_percent);
+    const weeklyUsed = Number(secondary.used_percent);
+    const h5 = Number.isFinite(h5Used) ? normalizePercent(100 - h5Used) : null;
+    const weekly = Number.isFinite(weeklyUsed) ? normalizePercent(100 - weeklyUsed) : null;
+    const h5ResetAt = normalizeResetTimestamp(primary.resets_at);
+    const weeklyResetAt = normalizeResetTimestamp(secondary.resets_at);
+    if (h5 === null && weekly === null && h5ResetAt === null && weeklyResetAt === null) return null;
+    return { h5, weekly, h5ResetAt, weeklyResetAt };
+  }
+
+  function applyRealtimeRateLimitFromChunk(streamState, chunk) {
+    if (!streamState) return;
+    const text = String(chunk || '');
+    if (!text) return;
+
+    const source = String(streamState.rateLimitTail || '') + text;
+    const lines = source.split(/\r?\n/);
+    streamState.rateLimitTail = lines.pop() || '';
+
+    let changed = false;
+    for (const rawLine of lines) {
+      const trimmed = String(rawLine || '').trim();
+      if (!trimmed) continue;
+      if (!trimmed.includes('rate_limits') && !trimmed.includes('rateLimits')) continue;
+      const candidate = trimmed.startsWith('data:') ? trimmed.slice(5).trim() : trimmed;
+      if (!candidate) continue;
+
+      let obj;
+      try {
+        obj = JSON.parse(candidate);
+      } catch {
+        continue;
+      }
+
+      if (String(obj?.type || '').toLowerCase() !== 'event_msg') continue;
+      const payload = obj?.payload || {};
+      if (String(payload.type || '').toLowerCase() !== 'token_count') continue;
+
+      const live = buildLiveRateLimitSnapshot(payload.rate_limits || payload.rateLimits);
+      if (!live) continue;
+      if (mergeCodexLimitSnapshot(live)) changed = true;
+    }
+
+    if (changed) renderCodexStatusbar();
+  }
+
   function normalizeResetTimestamp(value) {
     if (value == null) return null;
     if (value instanceof Date) {
@@ -1264,6 +1456,23 @@
       options = SANDBOX_OPTIONS;
       currentValue = sandboxMode;
       labelFn = opt => SANDBOX_LABELS[opt] || opt;
+    } else if (type === 'context') {
+      // 컨텍스트 압축 설정 메뉴
+      const contextOptions = [
+        { id: 'compress-toggle', label: `자동 압축: ${contextCompressionEnabled ? 'ON' : 'OFF'}`, active: contextCompressionEnabled },
+        { id: 'concise-toggle', label: `간결 모드: ${conciseMode ? 'ON' : 'OFF'}`, active: conciseMode },
+        { id: 'compress-now', label: '🗜️ 지금 압축 실행', active: false },
+        { id: 'limit-10', label: `임계값: 10개`, active: contextMaxMessages === 10 },
+        { id: 'limit-20', label: `임계값: 20개 (기본)`, active: contextMaxMessages === 20 },
+        { id: 'limit-40', label: `임계값: 40개`, active: contextMaxMessages === 40 },
+      ];
+      $runtimeMenu.innerHTML = contextOptions.map(opt => `
+        <button type="button" class="runtime-option ${opt.active ? 'active' : ''}" data-runtime-type="context" data-runtime-value="${opt.id}">
+          ${escapeHtml(opt.label)}
+        </button>
+      `).join('');
+      $runtimeMenu.classList.remove('hidden');
+      return;
     } else {
       return;
     }
@@ -1292,6 +1501,38 @@
       updateRuntimeHint();
       showSlashFeedback(`샌드박스 모드: ${SANDBOX_LABELS[value] || value}`, false);
     }
+    if (type === 'context') {
+      if (value === 'compress-toggle') {
+        contextCompressionEnabled = !contextCompressionEnabled;
+        saveContextSettings();
+        updateContextHint();
+        showSlashFeedback(`자동 컨텍스트 압축: ${contextCompressionEnabled ? 'ON' : 'OFF'}`, false);
+      } else if (value === 'concise-toggle') {
+        conciseMode = !conciseMode;
+        saveContextSettings();
+        updateContextHint();
+        showSlashFeedback(`간결 모드: ${conciseMode ? 'ON — 토큰 절약 활성화' : 'OFF'}`, false);
+      } else if (value === 'compress-now') {
+        const result = compressCurrentConversation();
+        if (result.success) {
+          renderMessages();
+          showSlashFeedback(
+            `컨텍스트 압축 완료: ${result.beforeCount}개 → ${result.afterCount}개 (${result.savedMessages}개 절약)`,
+            false
+          );
+        } else {
+          showSlashFeedback(result.reason || '압축할 수 없습니다.', true);
+        }
+      } else if (value.startsWith('limit-')) {
+        const num = parseInt(value.replace('limit-', ''), 10);
+        if (Number.isFinite(num) && num >= CONTEXT_MAX_MESSAGES_MIN) {
+          contextMaxMessages = num;
+          saveContextSettings();
+          updateContextHint();
+          showSlashFeedback(`자동 압축 임계값: ${num}개 메시지`, false);
+        }
+      }
+    }
     closeRuntimeMenu();
   }
 
@@ -1305,6 +1546,28 @@
     }
     if ($sandboxHint) {
       $sandboxHint.textContent = `샌드박스: ${SANDBOX_LABELS[sandboxMode] || sandboxMode}`;
+    }
+    updateContextHint();
+  }
+
+  function updateContextHint() {
+    if (!$contextHint) return;
+    const parts = [];
+    if (contextCompressionEnabled) {
+      parts.push(`압축:ON(${contextMaxMessages})`);
+    } else {
+      parts.push('압축:OFF');
+    }
+    if (conciseMode) {
+      parts.push('간결');
+    }
+    $contextHint.textContent = parts.join(' · ');
+    $contextHint.title = `컨텍스트 압축: ${contextCompressionEnabled ? `ON (${contextMaxMessages}개 초과 시 자동 압축)` : 'OFF'}\n간결 모드: ${conciseMode ? 'ON' : 'OFF'}\n클릭하여 설정 변경`;
+    // 활성 상태 시각적 표시
+    if (contextCompressionEnabled || conciseMode) {
+      $contextHint.classList.add('ctx-active');
+    } else {
+      $contextHint.classList.remove('ctx-active');
     }
   }
 
@@ -1434,7 +1697,12 @@
   }
 
   function buildCodexPrompt(promptText) {
-    return String(promptText || '').trim();
+    let text = String(promptText || '').trim();
+    // 간결 모드: 시스템 지시를 프롬프트 앞에 추가하여 출력 토큰 절감
+    if (conciseMode && text) {
+      text = `[지시: 간결하게 답변. 코드는 핵심만, 불필요한 설명 생략]\n${text}`;
+    }
+    return text;
   }
 
   function stripWrappingQuotes(text) {
@@ -2216,6 +2484,60 @@
       return true;
     }
 
+    if (command === '/compress') {
+      const result = compressCurrentConversation();
+      if (result.success) {
+        renderMessages();
+        showSlashFeedback(
+          `컨텍스트 압축 완료: ${result.beforeCount}개 → ${result.afterCount}개 메시지 (${result.savedMessages}개 절약)`,
+          false
+        );
+      } else {
+        showSlashFeedback(result.reason || '압축할 수 없습니다.', true);
+      }
+      return true;
+    }
+
+    if (command === '/concise') {
+      if (argText) {
+        const lower = argText.toLowerCase();
+        if (lower === 'on' || lower === 'true' || lower === '1') {
+          conciseMode = true;
+        } else if (lower === 'off' || lower === 'false' || lower === '0') {
+          conciseMode = false;
+        } else {
+          showSlashFeedback('사용법: /concise [on|off]', true);
+          return true;
+        }
+      } else {
+        conciseMode = !conciseMode;
+      }
+      saveContextSettings();
+      updateContextHint();
+      showSlashFeedback(`간결 모드: ${conciseMode ? 'ON — 토큰 절약 활성화' : 'OFF'}`, false);
+      return true;
+    }
+
+    if (command === '/context-limit') {
+      if (argText) {
+        const num = parseInt(argText, 10);
+        if (Number.isFinite(num) && num >= CONTEXT_MAX_MESSAGES_MIN && num <= CONTEXT_MAX_MESSAGES_MAX) {
+          contextMaxMessages = num;
+          saveContextSettings();
+          updateContextHint();
+          showSlashFeedback(`자동 압축 임계값: ${num}개 메시지`, false);
+        } else {
+          showSlashFeedback(`${CONTEXT_MAX_MESSAGES_MIN}~${CONTEXT_MAX_MESSAGES_MAX} 범위의 숫자를 입력하세요. 현재: ${contextMaxMessages}`, true);
+        }
+      } else {
+        contextCompressionEnabled = !contextCompressionEnabled;
+        saveContextSettings();
+        updateContextHint();
+        showSlashFeedback(`자동 컨텍스트 압축: ${contextCompressionEnabled ? `ON (${contextMaxMessages}개 초과 시)` : 'OFF'}`, false);
+      }
+      return true;
+    }
+
     if (command === '/version') {
       await runCodexSubcommand('--version', [], '');
       return true;
@@ -2562,6 +2884,17 @@
     });
   }
 
+  if ($contextHint) {
+    $contextHint.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      renderRuntimeMenu('context');
+    });
+  }
+
+  // 컨텍스트 힌트 초기화
+  updateContextHint();
+
   // 새 대화 시작 (또는 마지막 대화 복원)
   if (conversations.length > 0) {
     runInitStep('restore-conversation', () => loadConversation(conversations[0].id));
@@ -2881,7 +3214,15 @@
 
     for (const msg of conv.messages) {
       try {
-        appendMessageDOM(msg);
+        const el = appendMessageDOM(msg);
+        // 스트리밍 중인 메시지이면 streaming 클래스 추가 및 상태 참조 갱신
+        if (convStreams.has(activeConvId)) {
+          const st = convStreams.get(activeConvId);
+          if (st.streamId === msg.id) {
+            el.classList.add('streaming');
+            st.liveAiEl = el;
+          }
+        }
       } catch (err) {
         console.error('[renderMessages] skip message:', err, msg?.id);
       }
@@ -2902,7 +3243,7 @@
 
     const bodyContent = msg.role === 'user'
       ? escapeHtml(msg.content)
-      : renderAIBody(msg);
+      : renderAIBody(msg, { activeTab: msg.activeTab });
 
     el.innerHTML = `
       <div class="msg-header">
@@ -5827,14 +6168,17 @@
   }
 
   function hasPatchSignalInText(text) {
-    return /(\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File)|^@@|^diff --git|^---\s|^\+\+\+\s)/im
+    return /(\*{3}\s*(Begin Patch|End Patch|Update File:|Add File:|Delete File:|Move to:|End of File)|^@@|^diff --git|^index\s+\S+|^---\s+\S+|^\+\+\+\s+\S+|^new file mode\b|^deleted file mode\b|^rename (?:from|to)\b|^similarity index\b|^dissimilarity index\b|^`{3,}\s*diff\b)/im
       .test(String(text || ''));
   }
 
   function normalizePatchCandidateText(text) {
     let value = String(text || '');
     if (!value) return '';
-    if (/\\n/.test(value) && /(Begin Patch|Update File:|Add File:|Delete File:|Move to:|diff --git|@@)/i.test(value)) {
+    if (
+      /\\n/.test(value)
+      && /(Begin Patch|Update File:|Add File:|Delete File:|Move to:|diff --git|@@|---\s+\S+|\+\+\+\s+\S+|new file mode|deleted file mode|rename from|rename to)/i.test(value)
+    ) {
       value = value.replace(/\\r\\n/g, '\n').replace(/\\n/g, '\n');
     }
     return value.replace(/\\"/g, '"');
@@ -5966,6 +6310,10 @@
       if (!(
         /^\*{3}\s*(Update|Add|Delete|Move(?:\s+to)?)\s+File:/i.test(trimmed)
         || /^diff --git\b/i.test(trimmed)
+        || /^index\s+\S+/i.test(trimmed)
+        || /^---\s+\S+/.test(trimmed)
+        || /^\+\+\+\s+\S+/.test(trimmed)
+        || /^(?:new file mode|deleted file mode|rename from|rename to|similarity index|dissimilarity index)\b/i.test(trimmed)
         || /^@@/.test(trimmed)
       )) continue;
 
@@ -5989,7 +6337,13 @@
         if (block.length > 1400) break;
       }
 
-      const hasMeaningfulChange = block.some(entry => /^[+-]/.test(String(entry || '')) || /^@@/.test(String(entry || '').trim()));
+      const hasMeaningfulChange = block.some((entry) => {
+        const raw = String(entry || '');
+        const t = raw.trim();
+        if (/^@@/.test(t)) return true;
+        if (/^[+-]/.test(raw) && !/^(---|\+\+\+)/.test(raw)) return true;
+        return false;
+      });
       if (hasMeaningfulChange) {
         pushBlock(block);
       }
@@ -6315,7 +6669,7 @@
   function isMeaningfulPatchBlock(blockText) {
     const text = String(blockText || '');
     if (!text.trim()) return false;
-    if (!/(^\*{3}\s*Begin Patch\b|^\*{3}\s*(Update|Add|Delete)\s+File:|^diff --git\b|^@@)/mi.test(text)) {
+    if (!/(^\*{3}\s*Begin Patch\b|^\*{3}\s*(Update|Add|Delete)\s+File:|^diff --git\b|^@@|^---\s+\S+|^\+\+\+\s+\S+|^new file mode\b|^deleted file mode\b|^rename (?:from|to)\b)/mi.test(text)) {
       return false;
     }
     const changeCount = text
@@ -6374,6 +6728,24 @@
         const plusMatch = /^\+\+\+\s+(?:b\/)?(.+)$/.exec(trimmed);
         if (plusMatch && !/^\+\+\+\s+\/dev\/null$/i.test(trimmed)) {
           currentFile = normalizePatchFilePath(plusMatch[1]);
+        }
+      }
+
+      if (!currentFile) {
+        const minusMatch = /^---\s+(?:a\/)?(.+)$/.exec(trimmed);
+        if (
+          minusMatch
+          && !/^---\s+\/dev\/null$/i.test(trimmed)
+          && !/^---\s*(Update|Add|Delete|Move(?:\s+to)?):/i.test(trimmed)
+        ) {
+          currentFile = normalizePatchFilePath(minusMatch[1]);
+        }
+      }
+
+      if (!currentFile) {
+        const renameToMatch = /^rename to\s+(.+)$/i.exec(trimmed);
+        if (renameToMatch) {
+          currentFile = normalizePatchFilePath(renameToMatch[1]);
         }
       }
 
@@ -6454,6 +6826,71 @@
       .filter(entry => entry.file && entry.diff);
   }
 
+  function extractMeaningfulDiffChangeLine(rawLine) {
+    const line = String(rawLine || '');
+    if (!/^[+-]/.test(line)) return '';
+    if (/^(---|\+\+\+)/.test(line)) return '';
+    const body = line.slice(1).trim();
+    if (!body) return '';
+    if (/^[{}()[\],;]+$/.test(body)) return '';
+    if (/^(\/\/|#|\/\*|\*\/|\*)\s*$/.test(body)) return '';
+    return body.replace(/\s+/g, ' ').slice(0, 180);
+  }
+
+  function buildAutoCodeChangeSummaryLines(fileDiffBlocks, maxHighlightsPerFile = 2) {
+    const summaries = [];
+    for (const entry of Array.isArray(fileDiffBlocks) ? fileDiffBlocks : []) {
+      const file = String(entry?.file || '').trim();
+      const diff = String(entry?.diff || '');
+      if (!file || !diff) continue;
+
+      let added = 0;
+      let deleted = 0;
+      const highlights = [];
+      const seen = new Set();
+
+      for (const rawLine of diff.split(/\r?\n/)) {
+        const line = String(rawLine || '');
+        if (line.startsWith('+') && !line.startsWith('+++')) added += 1;
+        if (line.startsWith('-') && !line.startsWith('---')) deleted += 1;
+
+        const meaningful = extractMeaningfulDiffChangeLine(line);
+        if (!meaningful) continue;
+        if (seen.has(meaningful)) continue;
+        seen.add(meaningful);
+        highlights.push(meaningful);
+      }
+
+      const base = `${toCodeFileMarkdownLink(file)} (+${added} / -${deleted})`;
+      if (highlights.length === 0) {
+        summaries.push(`- ${base}`);
+        continue;
+      }
+      const top = highlights.slice(0, Math.max(1, Number(maxHighlightsPerFile) || 2));
+      const highlightText = top.map(item => `\`${escapeMarkdownText(item)}\``).join(', ');
+      summaries.push(`- ${base} · 핵심: ${highlightText}`);
+    }
+    return summaries;
+  }
+
+  function toSyntheticDiffFromSnippet(snippetCode, filePath = 'snippet.txt') {
+    const normalized = normalizeCodeFilePathForGrouping(filePath)
+      || normalizePatchFilePath(filePath)
+      || 'snippet.txt';
+    const safeFile = String(normalized || 'snippet.txt')
+      .replace(/^\/+/, '')
+      .replace(/^\.\/+/, '')
+      .trim() || 'snippet.txt';
+    const lines = String(snippetCode || '').replace(/\r\n/g, '\n').split('\n');
+    const limited = lines.slice(0, 320);
+    const out = [`--- a/${safeFile}`, `+++ b/${safeFile}`, '@@'];
+    for (const line of limited) {
+      out.push(`+${line}`);
+    }
+    if (lines.length > limited.length) out.push('+...');
+    return out.join('\n');
+  }
+
   function buildCodexCodeTabMarkdown(sections, rawText = '', actualCodeDiffs = []) {
     const details = getCodeChangeDetails(sections, rawText);
     const normalizedActualDiffs = normalizeActualCodeDiffEntries(actualCodeDiffs);
@@ -6474,12 +6911,30 @@
       patchBlocks.push(block);
     }
     const modelFileDiffBlocks = buildFileDiffBlocks(patchBlocks);
-    const fileDiffBlocks = normalizedActualDiffs.length > 0 ? normalizedActualDiffs : modelFileDiffBlocks;
-    const patchSummarySources = normalizedActualDiffs.length > 0
-      ? normalizedActualDiffs.map(item => item.diff)
-      : patchBlocks;
+    const fileDiffBlocks = normalizeActualCodeDiffEntries([
+      ...modelFileDiffBlocks,
+      ...normalizedActualDiffs,
+    ]);
+    const patchSummarySources = [
+      ...patchBlocks,
+      ...normalizedActualDiffs.map(item => item.diff),
+    ];
     const patchFiles = summarizePatchFilesFromBlocks(patchSummarySources);
-    if ((!details || details.length === 0) && patchFiles.length === 0) {
+    const diffSnippetKeys = new Set(
+      fileDiffBlocks
+        .map(item => normalizeDetailLine(item?.diff || '').slice(0, 900))
+        .filter(Boolean)
+    );
+    const codeSnippets = toCodeSnippetsForCodeTab(sections, rawText)
+      .filter((snippet) => {
+        const key = normalizeDetailLine(snippet?.code || '').slice(0, 900);
+        if (!key) return false;
+        if (diffSnippetKeys.has(key)) return false;
+        return true;
+      });
+    const autoSummaryLines = buildAutoCodeChangeSummaryLines(fileDiffBlocks);
+
+    if ((!details || details.length === 0) && patchFiles.length === 0 && codeSnippets.length === 0) {
       return '코드 변경 내용이 감지되지 않았습니다.';
     }
 
@@ -6542,12 +6997,30 @@
       }
     }
 
-    if (methodLines.length > 0) {
-      lines.push('', '### 변경 방식');
+    if (autoSummaryLines.length > 0 || methodLines.length > 0) {
+      lines.push('', '### 변경 요약');
+      for (const summary of autoSummaryLines) {
+        lines.push(summary);
+      }
       for (const line of methodLines) {
-        lines.push(`- ${escapeMarkdownText(line)}`);
+        lines.push(`- 설명: ${escapeMarkdownText(line)}`);
       }
     }
+
+    const fileCandidates = [...fileMap.values()]
+      .map(item => String(item?.file || '').trim())
+      .filter(Boolean);
+    const syntheticDiffBlocks = fileDiffBlocks.length === 0 && codeSnippets.length > 0
+      ? codeSnippets.slice(0, 3).map((snippet, idx) => {
+        const lang = String(snippet?.lang || '').trim().toLowerCase();
+        const ext = lang && /^[a-z0-9_+#.-]+$/.test(lang) ? lang.replace(/[^a-z0-9]+/g, '') : 'txt';
+        const file = fileCandidates[idx] || fileCandidates[0] || `snippet-${idx + 1}.${ext || 'txt'}`;
+        return {
+          file,
+          diff: toSyntheticDiffFromSnippet(String(snippet?.code || ''), file),
+        };
+      })
+      : [];
 
     if (fileDiffBlocks.length > 0) {
       lines.push('', '### 변경 Diff');
@@ -6555,9 +7028,26 @@
         lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
         lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
       });
+    } else if (syntheticDiffBlocks.length > 0) {
+      lines.push('', '### 변경 Diff');
+      lines.push('- Unified diff를 찾지 못해 코드 스니펫 기반 변경 diff를 생성했습니다.');
+      syntheticDiffBlocks.forEach((entry) => {
+        lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
+        lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
+      });
     } else {
       lines.push('', '### 변경 Diff');
       lines.push('- Unified diff(`+`, `-`)를 찾지 못했습니다.');
+    }
+
+    if (fileDiffBlocks.length === 0 && syntheticDiffBlocks.length === 0 && codeSnippets.length > 0) {
+      lines.push('', '### 코드 스니펫');
+      codeSnippets.forEach((snippet, idx) => {
+        const lang = String(snippet?.lang || '').trim().toLowerCase();
+        const title = lang ? `#### 스니펫 ${idx + 1} (${lang})` : `#### 스니펫 ${idx + 1}`;
+        lines.push('', title);
+        lines.push(toSafeCodeFenceMarkdown(String(snippet?.code || ''), lang));
+      });
     }
 
     return lines.join('\n');
@@ -6711,29 +7201,27 @@
     renderCodexStatusbar();
   }
 
-  async function refreshCodexRateLimits(reason = 'auto', options = {}) {
-    const now = Date.now();
-    const force = Boolean(options?.force);
-    const lastUpdatedAt = Number(codexLimitSnapshot?.updatedAt) || 0;
-    if (!force && lastUpdatedAt > 0 && now - lastUpdatedAt < CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS) {
-      renderCodexStatusbar();
-      return {
-        success: true,
-        skipped: true,
-        nextAt: lastUpdatedAt + CODEX_RATE_LIMIT_REFRESH_INTERVAL_MS,
-      };
-    }
-
+  async function refreshCodexRateLimits(reason = 'auto') {
     try {
       const result = await window.electronAPI.codex.rateLimits();
       if (result?.success) {
+        const h5RemainingRaw = normalizePercent(result.h5Remaining);
+        const weeklyRemainingRaw = normalizePercent(result.weeklyRemaining);
+        const h5Used = normalizePercent(result.h5Used);
+        const weeklyUsed = normalizePercent(result.weeklyUsed);
+        const h5Remaining = h5RemainingRaw != null
+          ? h5RemainingRaw
+          : (h5Used != null ? normalizePercent(100 - h5Used) : null);
+        const weeklyRemaining = weeklyRemainingRaw != null
+          ? weeklyRemainingRaw
+          : (weeklyUsed != null ? normalizePercent(100 - weeklyUsed) : null);
         const h5ResetAt = normalizeResetTimestamp(result.h5ResetsAt);
         const weeklyResetAt = normalizeResetTimestamp(result.weeklyResetsAt);
         const h5WindowMin = Number(result.h5Window);
         const weeklyWindowMin = Number(result.weeklyWindow);
         mergeCodexLimitSnapshot({
-          h5: normalizePercent(result.h5Remaining),
-          weekly: normalizePercent(result.weeklyRemaining),
+          h5: h5Remaining,
+          weekly: weeklyRemaining,
           h5ResetAt: h5ResetAt || (Number.isFinite(h5WindowMin) && h5WindowMin > 0 ? Date.now() + h5WindowMin * 60000 : null),
           weeklyResetAt: weeklyResetAt || (Number.isFinite(weeklyWindowMin) && weeklyWindowMin > 0 ? Date.now() + weeklyWindowMin * 60000 : null),
           updatedAt: Date.now(),
@@ -6953,12 +7441,25 @@
     // /search 처럼 resume 문맥과 충돌하는 옵션은 새 세션으로 실행한다.
     // --json은 buildCodexArgs 내부에서 항상 유지된다.
     const forceNewSession = Boolean(options?.forceNewSession);
-    const originalBuild = buildCodexArgs(forceNewSession ? null : getActiveConversation()?.codexSessionId);
-    const mergedArgs = mergeCodexExecArgsWithGlobalFlags(originalBuild, extraArgs);
 
     const conv = getActiveConversation();
     const profile = PROFILES.find(p => p.id === activeProfileId);
-    const runPrompt = buildCodexPrompt(promptText);
+
+    // === 자동 컨텍스트 압축 ===
+    const useCompression = !forceNewSession && shouldAutoCompress(conv);
+    let sessionIdForExtraRun = forceNewSession ? null : conv?.codexSessionId;
+    let runPrompt;
+
+    if (useCompression) {
+      runPrompt = buildCompressedPrompt(conv, buildCodexPrompt(promptText));
+      sessionIdForExtraRun = null;
+      console.log(`[context-compress] auto-compress in extraArgs: ${conv.messages.length} msgs`);
+    } else {
+      runPrompt = buildCodexPrompt(promptText);
+    }
+
+    const originalBuild = buildCodexArgs(sessionIdForExtraRun);
+    const mergedArgs = mergeCodexExecArgsWithGlobalFlags(originalBuild, extraArgs);
 
     if (conv.messages.length === 0) {
       conv.title = promptText.slice(0, 50) + (promptText.length > 50 ? '...' : '');
@@ -7042,21 +7543,28 @@
         responseStarted = true;
         if (elapsedTimer) clearInterval(elapsedTimer);
       }
+      const liveBody = resolveBodyEl();
       if (SHOW_STREAMING_WORK_PANEL) {
-        const logEl = bodyEl.querySelector('.thinking-log');
+        const logEl = liveBody.querySelector('.thinking-log');
         renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput, sections));
         scrollToBottom();
       } else {
         const progressLines = updateStreamingPreviewLines(previewState, fullOutput, sections);
         const previewResponse = String(sections?.response?.content || '').trim();
-        renderStreamingResponsePreview(bodyEl, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+        renderStreamingResponsePreview(liveBody, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
         scrollToBottom();
       }
     });
 
     // 대화별 스트리밍 상태 등록
-    const streamState = { streamId, elapsedTimer };
+    const streamState = { streamId, elapsedTimer, liveAiEl: null, rateLimitTail: '' };
     convStreams.set(convId, streamState);
+
+    // 대화 전환 후 돌아왔을 때 새로 생성된 DOM 요소를 반환
+    function resolveBodyEl() {
+      const el = streamState.liveAiEl || aiEl;
+      return el.querySelector('.msg-body') || bodyEl;
+    }
 
     if (convId === activeConvId) {
       isStreaming = true;
@@ -7072,6 +7580,7 @@
       if (id !== streamId || finished) return;
       fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
+      applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
 
       // 스트리밍 중 세션 ID 조기 캡처
@@ -7081,14 +7590,15 @@
       }
 
       if (convId === activeConvId) {
+        const liveBody = resolveBodyEl();
         const fastLines = updateStreamingPreviewFromChunk(previewState, chunk);
         if (SHOW_STREAMING_WORK_PANEL) {
-          const logEl = bodyEl.querySelector('.thinking-log');
+          const logEl = liveBody.querySelector('.thinking-log');
           renderThinkingLogLines(logEl, fastLines);
           scrollToBottom();
         } else {
           const previewResponse = String(latestSections?.response?.content || '').trim();
-          renderStreamingResponsePreview(bodyEl, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+          renderStreamingResponsePreview(liveBody, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
           scrollToBottom();
         }
       }
@@ -7109,6 +7619,7 @@
       if (finished) return;
       finished = true;
       scheduleStreamRender.cancel();
+      applyRealtimeRateLimitFromChunk(streamState, '\n');
 
       if (elapsedTimer) clearInterval(elapsedTimer);
       convStreams.delete(convId);
@@ -7129,18 +7640,45 @@
       const sid = extractCodexSessionId(finalSections);
       if (sid) conv.codexSessionId = sid;
 
+      // 토큰 사용량 기록
+      const usage = resolveCodexTurnUsage(runPrompt, aiMsg.content || '');
+      if (usage.total > 0) {
+        codexUsage.record(usage.total, parseEffort(finalSections));
+      }
+      updateCodexStatusbar(finalSections);
       void refreshCodexRateLimits('after-answer');
 
       if (convId === activeConvId) {
-        aiEl.classList.remove('streaming');
-        const finalBody = aiEl.querySelector('.msg-body');
-        finalBody.innerHTML = renderAIBody(aiMsg);
-        stickProcessStackToBottom(finalBody);
+        // 대화 전환 후 돌아온 경우 캡처된 aiEl이 DOM에서 제거되었을 수 있으므로 라이브 요소 조회
+        const liveEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+        liveEl.classList.remove('streaming');
+        const finalBody = liveEl.querySelector('.msg-body');
+        if (finalBody) {
+          finalBody.innerHTML = renderAIBody(aiMsg);
+          stickProcessStackToBottom(finalBody);
+        }
         syncStreamingUI();
         $input.focus();
       }
 
       saveConversations();
+
+      // 코드 diff 프리로드 (코드 탭 클릭 시 즉시 표시)
+      if (aiMsg.role !== 'error') {
+        loadActualCodeDiffsForCurrentCwd().then(diffs => {
+          if (Array.isArray(diffs) && diffs.length > 0) {
+            aiMsg.actualCodeDiffs = diffs;
+            aiMsg.actualCodeDiffsFetchedAt = Date.now();
+            saveConversations();
+            if (convId === activeConvId) {
+              const le = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`);
+              const fb = le?.querySelector('.msg-body');
+              const cp = fb?.querySelector('.msg-tab-content[data-tab-content="code"]');
+              if (cp) cp.dataset.codeRendered = '0';
+            }
+          }
+        }).catch(() => {});
+      }
     }
 
     try {
@@ -7158,13 +7696,15 @@
       if (!runResult?.success) {
         aiMsg.content = `실행 실패: ${runResult?.error || 'unknown'}`;
         aiMsg.role = 'error';
-        bodyEl.textContent = aiMsg.content;
+        const errBody = resolveBodyEl();
+        errBody.textContent = aiMsg.content;
         finishStream();
       }
     } catch (err) {
       aiMsg.content = `오류: ${err.message}`;
       aiMsg.role = 'error';
-      bodyEl.textContent = aiMsg.content;
+      const errBody = resolveBodyEl();
+      errBody.textContent = aiMsg.content;
       finishStream();
     }
   }
@@ -7288,7 +7828,22 @@
     const convId = activeConvId;
     const conv = getActiveConversation();
     const profile = PROFILES.find(p => p.id === activeProfileId);
-    const runPrompt = buildCodexPrompt(promptText);
+
+    // === 자동 컨텍스트 압축 ===
+    // 메시지 수가 임계값을 초과하면 압축 모드로 전환하여 토큰 절약
+    const useCompression = shouldAutoCompress(conv);
+    let runPrompt;
+    let sessionIdForRun = conv.codexSessionId;
+
+    if (useCompression) {
+      // 압축: 이전 대화를 요약하고 새 세션으로 시작
+      runPrompt = buildCompressedPrompt(conv, buildCodexPrompt(promptText));
+      sessionIdForRun = null; // 새 세션 시작 (요약된 컨텍스트로)
+      console.log(`[context-compress] auto-compress triggered: ${conv.messages.length} messages → compressed prompt`);
+    } else {
+      runPrompt = buildCodexPrompt(promptText);
+    }
+
     // 첫 메시지 → 제목 설정 + 작업 폴더 저장
     if (conv.messages.length === 0) {
       conv.title = promptText.slice(0, 50) + (promptText.length > 50 ? '...' : '');
@@ -7351,8 +7906,14 @@
     const streamId = aiMsg.id;
 
     // 대화별 스트리밍 상태 등록
-    const streamState = { streamId, elapsedTimer };
+    const streamState = { streamId, elapsedTimer, liveAiEl: null, rateLimitTail: '' };
     convStreams.set(convId, streamState);
+
+    // 대화 전환 후 돌아왔을 때 새로 생성된 DOM 요소를 반환
+    function resolveBodyEl() {
+      const el = streamState.liveAiEl || aiEl;
+      return el.querySelector('.msg-body') || bodyEl;
+    }
 
     // 현재 대화면 UI 동기화
     if (convId === activeConvId) {
@@ -7393,14 +7954,15 @@
         responseStarted = true;
         if (elapsedTimer) clearInterval(elapsedTimer);
       }
+      const liveBody = resolveBodyEl();
       if (SHOW_STREAMING_WORK_PANEL) {
-        const logEl = bodyEl.querySelector('.thinking-log');
+        const logEl = liveBody.querySelector('.thinking-log');
         renderThinkingLogLines(logEl, updateStreamingPreviewLines(previewState, fullOutput, sections));
         scrollToBottom();
       } else {
         const progressLines = updateStreamingPreviewLines(previewState, fullOutput, sections);
         const previewResponse = String(sections?.response?.content || '').trim();
-        renderStreamingResponsePreview(bodyEl, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+        renderStreamingResponsePreview(liveBody, previewResponse, progressLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
         scrollToBottom();
       }
     });
@@ -7409,6 +7971,7 @@
       if (id !== streamId || finished) return;
       fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
+      applyRealtimeRateLimitFromChunk(streamState, chunk);
       autoSaveIfNeeded();
 
       // 스트리밍 중 세션 ID 조기 캡처
@@ -7418,14 +7981,15 @@
       }
 
       if (convId === activeConvId) {
+        const liveBody = resolveBodyEl();
         const fastLines = updateStreamingPreviewFromChunk(previewState, chunk);
         if (SHOW_STREAMING_WORK_PANEL) {
-          const logEl = bodyEl.querySelector('.thinking-log');
+          const logEl = liveBody.querySelector('.thinking-log');
           renderThinkingLogLines(logEl, fastLines);
           scrollToBottom();
         } else {
           const previewResponse = String(latestSections?.response?.content || '').trim();
-          renderStreamingResponsePreview(bodyEl, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
+          renderStreamingResponsePreview(liveBody, previewResponse, fastLines, STREAM_INLINE_PROGRESS_VISIBLE_LINES);
           scrollToBottom();
         }
       }
@@ -7444,8 +8008,10 @@
       if (id !== streamId) return;
       aiMsg.content = `오류가 발생했습니다: ${error}`;
       aiMsg.role = 'error';
-      aiEl.className = 'message error';
-      aiEl.querySelector('.msg-body').textContent = aiMsg.content;
+      const liveEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+      liveEl.className = 'message error';
+      const errBody = liveEl.querySelector('.msg-body');
+      if (errBody) errBody.textContent = aiMsg.content;
       finishStream();
     });
 
@@ -7457,6 +8023,7 @@
       if (finished) return;
       finished = true;
       scheduleStreamRender.cancel();
+      applyRealtimeRateLimitFromChunk(streamState, '\n');
 
       if (elapsedTimer) clearInterval(elapsedTimer);
       convStreams.delete(convId);
@@ -7490,10 +8057,14 @@
 
       // 현재 보고있는 대화이면 DOM 직접 업데이트
       if (convId === activeConvId) {
-        aiEl.classList.remove('streaming');
-        const finalBody = aiEl.querySelector('.msg-body');
-        finalBody.innerHTML = renderAIBody(aiMsg);
-        stickProcessStackToBottom(finalBody);
+        // 대화 전환 후 돌아온 경우 캡처된 aiEl이 DOM에서 제거되었을 수 있으므로 라이브 요소 조회
+        const liveEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+        liveEl.classList.remove('streaming');
+        const finalBody = liveEl.querySelector('.msg-body');
+        if (finalBody) {
+          finalBody.innerHTML = renderAIBody(aiMsg);
+          stickProcessStackToBottom(finalBody);
+        }
         syncStreamingUI();
         $input.focus();
       }
@@ -7501,6 +8072,23 @@
       // (나중에 해당 대화로 돌아오면 renderMessages()에서 최종 내용 렌더링)
 
       saveConversations();
+
+      // 코드 diff 프리로드 (코드 탭 클릭 시 즉시 표시)
+      if (aiMsg.role !== 'error') {
+        loadActualCodeDiffsForCurrentCwd().then(diffs => {
+          if (Array.isArray(diffs) && diffs.length > 0) {
+            aiMsg.actualCodeDiffs = diffs;
+            aiMsg.actualCodeDiffsFetchedAt = Date.now();
+            saveConversations();
+            if (convId === activeConvId) {
+              const le = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`);
+              const fb = le?.querySelector('.msg-body');
+              const cp = fb?.querySelector('.msg-tab-content[data-tab-content="code"]');
+              if (cp) cp.dataset.codeRendered = '0';
+            }
+          }
+        }).catch(() => {});
+      }
     }
 
     // CLI 실행
@@ -7509,7 +8097,7 @@
         id: streamId,
         profile: {
           command: profile.command,
-          args: buildCodexArgs(conv.codexSessionId),
+          args: buildCodexArgs(sessionIdForRun),
           mode: profile.mode,
           env: {},
         },
@@ -7520,15 +8108,19 @@
       if (!runResult?.success) {
         aiMsg.content = `CLI 실행 실패: ${runResult?.error || 'unknown error'}`;
         aiMsg.role = 'error';
-        aiEl.className = 'message error';
-        aiEl.querySelector('.msg-body').textContent = aiMsg.content;
+        const errEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+        errEl.className = 'message error';
+        const errBody = errEl.querySelector('.msg-body');
+        if (errBody) errBody.textContent = aiMsg.content;
         finishStream();
       }
     } catch (error) {
       aiMsg.content = `CLI 실행 오류: ${error?.message || String(error)}`;
       aiMsg.role = 'error';
-      aiEl.className = 'message error';
-      aiEl.querySelector('.msg-body').textContent = aiMsg.content;
+      const errEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
+      errEl.className = 'message error';
+      const errBody = errEl.querySelector('.msg-body');
+      if (errBody) errBody.textContent = aiMsg.content;
       finishStream();
     }
   }
@@ -7867,6 +8459,13 @@
     body.querySelectorAll('.msg-tab-content').forEach(c =>
       c.classList.toggle('hidden', c.dataset.tabContent !== target)
     );
+    // 탭 상태를 메시지 데이터에 저장 (대화 전환 후 복원용)
+    const messageEl = body.closest('.message');
+    const msgId = messageEl?.dataset?.msgId;
+    if (msgId) {
+      const msg = getActiveConversationMessageById(msgId);
+      if (msg) msg.activeTab = target;
+    }
     if (target === 'process') {
       requestAnimationFrame(() => stickProcessStackToBottom(body));
       return;

@@ -1950,6 +1950,12 @@ body.sidebar-resizing * {
 }
 .runtime-select-btn:hover { color: var(--accent-hover); }
 
+/* Context compression hint - active state */
+#context-compress-hint.ctx-active {
+  color: var(--accent);
+  font-weight: 600;
+}
+
 /* ══════════════════════════════════════════
    RUNTIME SELECTOR MENU
    ══════════════════════════════════════════ */
