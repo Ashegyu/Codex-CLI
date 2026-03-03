@@ -7276,7 +7276,8 @@
     return out.join('\n');
   }
 
-  function buildCodexCodeTabMarkdown(sections, rawText = '', actualCodeDiffs = []) {
+  /* ── 코드 탭 diff 데이터 추출 ───────────────── */
+  function getCodexCodeDiffEntries(sections, rawText = '', actualCodeDiffs = []) {
     const normalizedActualDiffs = normalizeActualCodeDiffEntries(actualCodeDiffs);
     const sourcePatchText = [
       String(sections?.response?.raw || ''),
@@ -7295,14 +7296,37 @@
       patchBlocks.push(block);
     }
     const modelFileDiffBlocks = buildFileDiffBlocks(patchBlocks);
-    const fileDiffBlocks = normalizeActualCodeDiffEntries([
+    return normalizeActualCodeDiffEntries([
       ...modelFileDiffBlocks,
       ...normalizedActualDiffs,
     ]);
+  }
+
+  function countDiffStats(diffText) {
+    const lines = String(diffText || '').split(/\r?\n/);
+    let added = 0, deleted = 0;
+    for (const line of lines) {
+      if (/^\+[^+]/.test(line) || line === '+') added++;
+      else if (/^-[^-]/.test(line) || line === '-') deleted++;
+    }
+    return { added, deleted };
+  }
+
+  function toCodeFileHtmlLink(filePath) {
+    const md = toCodeFileMarkdownLink(filePath);
+    const match = /^\[([^\]]*)\]\(([^)]*)\)$/.exec(md);
+    if (match) {
+      const display = match[1].replace(/\\([[\]*_`\\])/g, '$1');
+      return `<a href="${escapeHtml(match[2])}" title="${escapeHtml(display)}">${escapeHtml(display)}</a>`;
+    }
+    return `<span>${escapeHtml(md.replace(/^`|`$/g, ''))}</span>`;
+  }
+
+  function buildCodexCodeTabMarkdown(sections, rawText = '', actualCodeDiffs = []) {
+    const fileDiffBlocks = getCodexCodeDiffEntries(sections, rawText, actualCodeDiffs);
     if (fileDiffBlocks.length === 0) {
       return 'Unified diff(`+`, `-`)를 찾지 못했습니다.';
     }
-
     const lines = ['### 변경 Diff'];
     fileDiffBlocks.forEach((entry) => {
       lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
@@ -7312,8 +7336,57 @@
   }
 
   function renderCodexCodeBrief(sections, rawText = '', actualCodeDiffs = []) {
-    const markdown = buildCodexCodeTabMarkdown(sections, rawText, actualCodeDiffs);
-    return `<div class="code-brief">${renderMarkdown(markdown, { skipPreprocess: true })}</div>`;
+    const fileDiffBlocks = getCodexCodeDiffEntries(sections, rawText, actualCodeDiffs);
+    if (fileDiffBlocks.length === 0) {
+      return `<div class="code-brief code-brief-v2">
+        <div class="diff-empty-state">
+          <svg class="diff-empty-icon" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="12" y1="18" x2="12" y2="12"/><line x1="9" y1="15" x2="15" y2="15"/></svg>
+          <p>Unified diff(<code>+</code>, <code>-</code>)를 찾지 못했습니다.</p>
+        </div>
+      </div>`;
+    }
+
+    let totalAdd = 0, totalDel = 0;
+    const entries = fileDiffBlocks.map(entry => {
+      const stats = countDiffStats(entry.diff);
+      totalAdd += stats.added;
+      totalDel += stats.deleted;
+      return { file: entry.file, diff: entry.diff, added: stats.added, deleted: stats.deleted };
+    });
+
+    const parts = [];
+
+    // 요약 바
+    parts.push(`<div class="diff-summary-bar">`);
+    parts.push(`<div class="diff-summary-left">`);
+    parts.push(`<svg class="diff-summary-icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>`);
+    parts.push(`<span class="diff-summary-title">변경 사항</span>`);
+    parts.push(`<span class="diff-summary-count">${entries.length}개 파일</span>`);
+    parts.push(`</div>`);
+    parts.push(`<div class="diff-summary-right">`);
+    if (totalAdd > 0) parts.push(`<span class="diff-stat-badge diff-stat-add">+${totalAdd}</span>`);
+    if (totalDel > 0) parts.push(`<span class="diff-stat-badge diff-stat-del">-${totalDel}</span>`);
+    parts.push(`</div>`);
+    parts.push(`</div>`);
+
+    // 파일별 섹션
+    entries.forEach((entry, idx) => {
+      const fileHtml = toCodeFileHtmlLink(entry.file);
+      const isOpen = entries.length <= 5 || idx < 3;
+      parts.push(`<details class="diff-file-section"${isOpen ? ' open' : ''}>`);
+      parts.push(`<summary class="diff-file-header-row">`);
+      parts.push(`<span class="diff-file-chevron"><svg width="10" height="10" viewBox="0 0 10 10" fill="currentColor"><path d="M3 1.5L7.5 5 3 8.5z"/></svg></span>`);
+      parts.push(`<span class="diff-file-name">${fileHtml}</span>`);
+      parts.push(`<span class="diff-file-stats">`);
+      if (entry.added > 0) parts.push(`<span class="diff-stat-badge diff-stat-add">+${entry.added}</span>`);
+      if (entry.deleted > 0) parts.push(`<span class="diff-stat-badge diff-stat-del">-${entry.deleted}</span>`);
+      parts.push(`</span>`);
+      parts.push(`</summary>`);
+      parts.push(`<div class="diff-file-content">${renderDiffCodeBlock(entry.diff, 'diff')}</div>`);
+      parts.push(`</details>`);
+    });
+
+    return `<div class="code-brief code-brief-v2">${parts.join('\n')}</div>`;
   }
 
   function getCodexProcessItems(sections, isStreaming, rawText = '') {
