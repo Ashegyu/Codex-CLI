@@ -3333,10 +3333,11 @@
           </div>
         `;
       }
+      const isActive = c.id === activeConvId;
       return `
-        <div class="history-row">
-          <button class="history-item ${c.id === activeConvId ? 'active' : ''}" data-id="${c.id}">
-            ${escapeHtml(c.title || '새 대화')}
+        <div class="history-row${isActive ? ' is-active' : ''}">
+          <button class="history-item${isActive ? ' active' : ''}" data-id="${c.id}">
+            <span class="history-title-text">${escapeHtml(c.title || '새 대화')}</span>
           </button>
           <button class="history-rename-btn" data-rename-id="${c.id}" title="대화 이름 변경">✎</button>
           <button class="history-delete-btn" data-delete-id="${c.id}" title="이 대화 삭제">✕</button>
@@ -3385,6 +3386,30 @@
         if (e.key === 'Enter') { e.preventDefault(); commitRenameConversation(convId, input.value); }
         if (e.key === 'Escape') { e.preventDefault(); cancelRenameConversation(); }
       });
+
+      // 마우스오버 시 잘린 제목 marquee 스크롤
+      $historyList.addEventListener('mouseenter', (e) => {
+        const item = e.target.closest('.history-item');
+        if (!item) return;
+        const textEl = item.querySelector('.history-title-text');
+        if (!textEl) return;
+        // 텍스트가 버튼보다 넓으면 스크롤
+        const overflow = textEl.scrollWidth - item.clientWidth;
+        if (overflow > 4) {
+          const dur = Math.max(2, Math.min(overflow / 40, 8));
+          textEl.style.setProperty('--marquee-offset', `-${overflow + 20}px`);
+          textEl.style.setProperty('--marquee-duration', `${dur}s`);
+          textEl.classList.add('is-overflowing');
+        }
+      }, true);
+      $historyList.addEventListener('mouseleave', (e) => {
+        const item = e.target.closest('.history-item');
+        if (!item) return;
+        const textEl = item.querySelector('.history-title-text');
+        if (textEl) {
+          textEl.classList.remove('is-overflowing');
+        }
+      }, true);
     }
 
     // 편집 중인 항목의 값 복원
