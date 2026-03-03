@@ -680,9 +680,17 @@
     { id: 'codex', name: 'Codex CLI', command: 'codex', args: ['exec', '--full-auto', '--skip-git-repo-check'], mode: 'pipe', color: '#10A37F', icon: 'X' },
   ];
 
+  // === 대화 맵 (O(1) 조회) — 상태 선언 전에 정의 ===
+  const _convMap = new Map();
+  function _rebuildConvMap() {
+    _convMap.clear();
+    for (const c of conversations) _convMap.set(c.id, c);
+  }
+
   // === 상태 ===
   let activeProfileId = 'codex';
   let conversations = await loadConversationsSafe();
+  _rebuildConvMap();
   let activeConvId = null;
   let isStreaming = false;
   let currentStreamId = null;
@@ -791,6 +799,32 @@
   const STREAM_RENDER_THROTTLE_MS = 70;
   const STREAM_SECTIONS_PARSE_INTERVAL_MS = 280;
   const SHOW_STREAMING_WORK_PANEL = false;
+
+  // === 렌더링 캐시 (성능 최적화) ===
+  const _renderCache = new Map(); // key: contentHash → rendered HTML
+  const _RENDER_CACHE_MAX = 200;
+  function _contentHash(content) {
+    const s = String(content || '');
+    const len = s.length;
+    let h = 0;
+    // FNV-1a-like fast hash (처음/중간/끝 샘플링)
+    for (let i = 0; i < Math.min(len, 200); i++) h = (h ^ s.charCodeAt(i)) * 0x01000193 >>> 0;
+    if (len > 400) {
+      const mid = len >>> 1;
+      for (let i = mid; i < Math.min(mid + 100, len); i++) h = (h ^ s.charCodeAt(i)) * 0x01000193 >>> 0;
+    }
+    for (let i = Math.max(0, len - 200); i < len; i++) h = (h ^ s.charCodeAt(i)) * 0x01000193 >>> 0;
+    return `${len}_${h}`;
+  }
+  function getCachedRender(content) { return _renderCache.get(_contentHash(content)); }
+  function setCachedRender(content, html) {
+    if (_renderCache.size >= _RENDER_CACHE_MAX) {
+      const firstKey = _renderCache.keys().next().value;
+      _renderCache.delete(firstKey);
+    }
+    _renderCache.set(_contentHash(content), html);
+  }
+  function invalidateRenderCache(content) { _renderCache.delete(_contentHash(content)); }
 
   let slashMenuItems = [];
   let slashSelectedIndex = 0;
@@ -2318,13 +2352,13 @@
     if (removed <= 0) return 0;
 
     conversations = remain;
+    _rebuildConvMap();
     if (removedActive) {
       activeConvId = conversations.length > 0 ? conversations[0].id : null;
     }
 
     saveConversations();
     renderMessages();
-    renderHistory();
     return removed;
   }
 
@@ -3140,6 +3174,7 @@
   }
 
   // === 초기화 ===
+  let _historyDelegationReady = false;
   runInitStep('sidebar-layout', () => initSidebarLayout());
   runInitStep('sidebar-meta', () => initSidebarMeta());
   runInitStep('cwd', () => initCwd());
@@ -3278,6 +3313,7 @@
   }
 
   // === 대화 히스토리 ===
+
   function renderHistory() {
     $historyList.innerHTML = conversations.map((c) => {
       const isEditing = historyEditingId === c.id;
@@ -3308,70 +3344,94 @@
       `;
     }).join('');
 
-    $historyList.querySelectorAll('.history-item').forEach(el => {
-      el.addEventListener('click', () => loadConversation(el.dataset.id));
-    });
+    // 이벤트 위임: 한 번만 등록하고 이후에는 재등록하지 않음
+    if (!_historyDelegationReady) {
+      _historyDelegationReady = true;
 
-    $historyList.querySelectorAll('.history-rename-input').forEach(el => {
-      const conv = conversations.find(c => c.id === el.dataset.renameInputId);
-      if (!conv) return;
-      el.value = conv.title || '';
-      el.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter') {
-          e.preventDefault();
-          commitRenameConversation(conv.id, el.value);
+      $historyList.addEventListener('click', (e) => {
+        const target = e.target;
+
+        // 대화 선택
+        const histItem = target.closest('.history-item');
+        if (histItem) { loadConversation(histItem.dataset.id); return; }
+
+        // 이름 변경 시작
+        const renameBtn = target.closest('.history-rename-btn');
+        if (renameBtn) { e.preventDefault(); e.stopPropagation(); beginRenameConversation(renameBtn.dataset.renameId); return; }
+
+        // 이름 저장
+        const saveBtn = target.closest('.history-rename-save-btn');
+        if (saveBtn) {
+          e.preventDefault(); e.stopPropagation();
+          const id = saveBtn.dataset.renameSaveId;
+          const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
+          commitRenameConversation(id, input?.value || '');
           return;
         }
-        if (e.key === 'Escape') {
-          e.preventDefault();
-          cancelRenameConversation();
-        }
-      });
-    });
 
-    $historyList.querySelectorAll('.history-rename-btn').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        beginRenameConversation(el.dataset.renameId);
-      });
-    });
+        // 이름 변경 취소
+        const cancelBtn = target.closest('.history-rename-cancel-btn');
+        if (cancelBtn) { e.preventDefault(); e.stopPropagation(); cancelRenameConversation(); return; }
 
-    $historyList.querySelectorAll('.history-rename-save-btn').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        const id = el.dataset.renameSaveId;
-        const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${id}"]`);
-        commitRenameConversation(id, input?.value || '');
+        // 삭제
+        const delBtn = target.closest('.history-delete-btn');
+        if (delBtn) { e.preventDefault(); e.stopPropagation(); deleteConversation(delBtn.dataset.deleteId); return; }
       });
-    });
 
-    $historyList.querySelectorAll('.history-rename-cancel-btn').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        cancelRenameConversation();
+      $historyList.addEventListener('keydown', (e) => {
+        const input = e.target.closest('.history-rename-input');
+        if (!input) return;
+        const convId = input.dataset.renameInputId;
+        if (e.key === 'Enter') { e.preventDefault(); commitRenameConversation(convId, input.value); }
+        if (e.key === 'Escape') { e.preventDefault(); cancelRenameConversation(); }
       });
-    });
+    }
 
-    $historyList.querySelectorAll('.history-delete-btn').forEach(el => {
-      el.addEventListener('click', (e) => {
-        e.preventDefault();
-        e.stopPropagation();
-        deleteConversation(el.dataset.deleteId);
-      });
-    });
+    // 편집 중인 항목의 값 복원
+    if (historyEditingId) {
+      const input = $historyList.querySelector(`.history-rename-input[data-rename-input-id="${historyEditingId}"]`);
+      if (input) {
+        const conv = _convMap.get(historyEditingId);
+        input.value = conv?.title || '';
+      }
+    }
   }
 
   let lastAutoSave = 0;
   const AUTO_SAVE_INTERVAL = 5000; // 5초마다 자동 저장
 
+  // base64/dataUrl 제거 후 저장 (직렬화 크기 절감)
+  function _stripBinaryForSave(data) {
+    return data.map(conv => ({
+      ...conv,
+      messages: conv.messages.map(msg => {
+        if (!msg.attachments || !msg.attachments.length) return msg;
+        return {
+          ...msg,
+          attachments: msg.attachments.map(att => ({
+            fileType: att.fileType,
+            fileName: att.fileName,
+            path: att.path,
+            mimeType: att.mimeType,
+            size: att.size,
+            // base64, dataUrl 제외 — 용량 절감
+          })),
+        };
+      }),
+    }));
+  }
+
+  let _saveDebounceTimer = null;
   function saveConversations() {
     lastAutoSave = Date.now();
-    window.electronAPI.store.saveConversations(conversations).catch(err => {
-      console.error('[save] conversations error:', err);
-    });
+    // 디바운스: 300ms 이내 중복 호출 병합
+    if (_saveDebounceTimer) clearTimeout(_saveDebounceTimer);
+    _saveDebounceTimer = setTimeout(() => {
+      _saveDebounceTimer = null;
+      window.electronAPI.store.saveConversations(_stripBinaryForSave(conversations)).catch(err => {
+        console.error('[save] conversations error:', err);
+      });
+    }, 300);
     renderHistory();
   }
 
@@ -3379,14 +3439,16 @@
   function autoSaveIfNeeded() {
     if (convStreams.size > 0 && Date.now() - lastAutoSave >= AUTO_SAVE_INTERVAL) {
       lastAutoSave = Date.now();
-      window.electronAPI.store.saveConversations(conversations).catch(() => {});
+      window.electronAPI.store.saveConversations(_stripBinaryForSave(conversations)).catch(() => {});
     }
   }
 
   // 앱 종료 시 동기 저장 — 스트리밍 중이어도 받은 데이터까지 보존
   window.addEventListener('beforeunload', () => {
     try {
-      window.electronAPI.store.saveConversationsSync(conversations);
+      // 디바운스 타이머가 남아있으면 즉시 실행
+      if (_saveDebounceTimer) { clearTimeout(_saveDebounceTimer); _saveDebounceTimer = null; }
+      window.electronAPI.store.saveConversationsSync(_stripBinaryForSave(conversations));
     } catch { /* ignore */ }
   });
 
@@ -3396,6 +3458,7 @@
 
     const removingActive = activeConvId === id;
     conversations.splice(idx, 1);
+    _convMap.delete(id);
 
     if (removingActive) {
       activeConvId = conversations.length > 0 ? conversations[0].id : null;
@@ -3404,11 +3467,10 @@
 
     saveConversations();
     renderMessages();
-    renderHistory();
   }
 
   function beginRenameConversation(id) {
-    const conv = conversations.find(c => c.id === id);
+    const conv = _convMap.get(id);
     if (!conv) return;
     historyEditingId = id;
     renderHistory();
@@ -3427,7 +3489,7 @@
   }
 
   function commitRenameConversation(id, nextTitleRaw) {
-    const conv = conversations.find(c => c.id === id);
+    const conv = _convMap.get(id);
     if (!conv) {
       cancelRenameConversation();
       return;
@@ -3456,10 +3518,10 @@
       codexSessionId: null,
     };
     conversations.unshift(conv);
+    _convMap.set(conv.id, conv);
     activeConvId = conv.id;
     saveConversations();
     renderMessages();
-    renderHistory();
     syncStreamingUI();
     $input.focus();
   }
@@ -3492,7 +3554,7 @@
   }
 
   function getActiveConversation() {
-    return conversations.find(c => c.id === activeConvId);
+    return _convMap.get(activeConvId) || null;
   }
 
   // === 메시지 렌더링 ===
@@ -3500,19 +3562,19 @@
     const conv = getActiveConversation();
     if (!conv || conv.messages.length === 0) {
       $welcome.style.display = '';
-      // 기존 메시지 요소 제거 (웰컴 제외)
       $messages.querySelectorAll('.message').forEach(el => el.remove());
       return;
     }
     $welcome.style.display = 'none';
 
-    // 기존 메시지 요소 제거
+    // 기존 메시지 요소 일괄 제거
     $messages.querySelectorAll('.message').forEach(el => el.remove());
 
+    // DocumentFragment로 일괄 삽입 → reflow 1회만 발생
+    const frag = document.createDocumentFragment();
     for (const msg of conv.messages) {
       try {
-        const el = appendMessageDOM(msg);
-        // 스트리밍 중인 메시지이면 streaming 클래스 추가 및 상태 참조 갱신
+        const el = appendMessageDOM(msg, frag);
         if (convStreams.has(activeConvId)) {
           const st = convStreams.get(activeConvId);
           if (st.streamId === msg.id) {
@@ -3524,10 +3586,11 @@
         console.error('[renderMessages] skip message:', err, msg?.id);
       }
     }
+    $messages.appendChild(frag);
     scrollToBottom({ force: true });
   }
 
-  function appendMessageDOM(msg) {
+  function appendMessageDOM(msg, targetParent) {
     const profile = PROFILES.find(p => p.id === msg.profileId) || PROFILES[0];
     const el = document.createElement('div');
     el.className = `message ${msg.role}`;
@@ -3567,7 +3630,7 @@
       <div class="msg-body">${bodyContent}</div>
     `;
 
-    $messages.appendChild(el);
+    (targetParent || $messages).appendChild(el);
     if (msg.profileId === 'codex' && msg.role !== 'user') {
       requestAnimationFrame(() => stickProcessStackToBottom(el.querySelector('.msg-body')));
     }
@@ -7214,7 +7277,6 @@
   }
 
   function buildCodexCodeTabMarkdown(sections, rawText = '', actualCodeDiffs = []) {
-    const details = getCodeChangeDetails(sections, rawText);
     const normalizedActualDiffs = normalizeActualCodeDiffEntries(actualCodeDiffs);
     const sourcePatchText = [
       String(sections?.response?.raw || ''),
@@ -7237,141 +7299,15 @@
       ...modelFileDiffBlocks,
       ...normalizedActualDiffs,
     ]);
-    const patchSummarySources = [
-      ...patchBlocks,
-      ...normalizedActualDiffs.map(item => item.diff),
-    ];
-    const patchFiles = summarizePatchFilesFromBlocks(patchSummarySources);
-    const diffSnippetKeys = new Set(
-      fileDiffBlocks
-        .map(item => normalizeDetailLine(item?.diff || '').slice(0, 900))
-        .filter(Boolean)
-    );
-    const codeSnippets = toCodeSnippetsForCodeTab(sections, rawText)
-      .filter((snippet) => {
-        const key = normalizeDetailLine(snippet?.code || '').slice(0, 900);
-        if (!key) return false;
-        if (diffSnippetKeys.has(key)) return false;
-        return true;
-      });
-    const autoSummaryLines = buildAutoCodeChangeSummaryLines(fileDiffBlocks);
-
-    if ((!details || details.length === 0) && patchFiles.length === 0 && codeSnippets.length === 0) {
-      return '코드 변경 내용이 감지되지 않았습니다.';
+    if (fileDiffBlocks.length === 0) {
+      return 'Unified diff(`+`, `-`)를 찾지 못했습니다.';
     }
 
-    const fileMap = new Map();
-    const methodLines = [];
-
-    for (const detail of details) {
-      const line = normalizeDetailLine(detail);
-      if (!line) continue;
-
-      const fileOp = line.match(/^(수정 파일|추가 파일|삭제 파일|파일 이동|관련 파일)\s*:\s*(.+)$/i);
-      if (fileOp) {
-        const op = String(fileOp[1] || '').trim();
-        const file = String(fileOp[2] || '').trim();
-        const normalizedFile = normalizeCodeFilePathForGrouping(file) || normalizePatchFilePath(file) || file;
-        const key = toCodeFileGroupKey(normalizedFile) || normalizedFile.toLowerCase();
-        if (!fileMap.has(key)) {
-          fileMap.set(key, { file: normalizedFile, ops: new Set(), added: 0, deleted: 0 });
-        }
-        const entry = fileMap.get(key);
-        entry.file = choosePreferredCodeFilePath(entry.file, normalizedFile);
-        entry.ops.add(op);
-        continue;
-      }
-
-      methodLines.push(line);
-    }
-
-    for (const patchFile of patchFiles) {
-      const file = String(patchFile?.file || '').trim();
-      if (!file) continue;
-      const normalizedFile = normalizeCodeFilePathForGrouping(file) || normalizePatchFilePath(file) || file;
-      const key = toCodeFileGroupKey(normalizedFile) || normalizedFile.toLowerCase();
-      if (!fileMap.has(key)) {
-        fileMap.set(key, { file: normalizedFile, ops: new Set(), added: 0, deleted: 0 });
-      }
-      const item = fileMap.get(key);
-      item.file = choosePreferredCodeFilePath(item.file, normalizedFile);
-      const opList = patchFile?.ops instanceof Set
-        ? [...patchFile.ops]
-        : (Array.isArray(patchFile?.ops) ? patchFile.ops : []);
-      for (const op of opList) {
-        item.ops.add(op);
-      }
-      item.added += Number(patchFile.added) || 0;
-      item.deleted += Number(patchFile.deleted) || 0;
-    }
-
-    const lines = [];
-    lines.push('### 변경 파일');
-    if (fileMap.size === 0) {
-      lines.push('- 감지된 파일 경로가 없습니다.');
-    } else {
-      for (const { file, ops, added, deleted } of fileMap.values()) {
-        const opText = [...ops].join(', ') || '변경 파일';
-        const diffText = (Number(added) > 0 || Number(deleted) > 0)
-          ? ` (+${Number(added) || 0} / -${Number(deleted) || 0})`
-          : '';
-        lines.push(`- ${escapeMarkdownText(`${opText}${diffText}`)}: ${toCodeFileMarkdownLink(file)}`);
-      }
-    }
-
-    if (autoSummaryLines.length > 0 || methodLines.length > 0) {
-      lines.push('', '### 변경 요약');
-      for (const summary of autoSummaryLines) {
-        lines.push(summary);
-      }
-      for (const line of methodLines) {
-        lines.push(`- 설명: ${escapeMarkdownText(line)}`);
-      }
-    }
-
-    const fileCandidates = [...fileMap.values()]
-      .map(item => String(item?.file || '').trim())
-      .filter(Boolean);
-    const syntheticDiffBlocks = fileDiffBlocks.length === 0 && codeSnippets.length > 0
-      ? codeSnippets.slice(0, 3).map((snippet, idx) => {
-        const lang = String(snippet?.lang || '').trim().toLowerCase();
-        const ext = lang && /^[a-z0-9_+#.-]+$/.test(lang) ? lang.replace(/[^a-z0-9]+/g, '') : 'txt';
-        const file = fileCandidates[idx] || fileCandidates[0] || `snippet-${idx + 1}.${ext || 'txt'}`;
-        return {
-          file,
-          diff: toSyntheticDiffFromSnippet(String(snippet?.code || ''), file),
-        };
-      })
-      : [];
-
-    if (fileDiffBlocks.length > 0) {
-      lines.push('', '### 변경 Diff');
-      fileDiffBlocks.forEach((entry) => {
-        lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
-        lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
-      });
-    } else if (syntheticDiffBlocks.length > 0) {
-      lines.push('', '### 변경 Diff');
-      lines.push('- Unified diff를 찾지 못해 코드 스니펫 기반 변경 diff를 생성했습니다.');
-      syntheticDiffBlocks.forEach((entry) => {
-        lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
-        lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
-      });
-    } else {
-      lines.push('', '### 변경 Diff');
-      lines.push('- Unified diff(`+`, `-`)를 찾지 못했습니다.');
-    }
-
-    if (fileDiffBlocks.length === 0 && syntheticDiffBlocks.length === 0 && codeSnippets.length > 0) {
-      lines.push('', '### 코드 스니펫');
-      codeSnippets.forEach((snippet, idx) => {
-        const lang = String(snippet?.lang || '').trim().toLowerCase();
-        const title = lang ? `#### 스니펫 ${idx + 1} (${lang})` : `#### 스니펫 ${idx + 1}`;
-        lines.push('', title);
-        lines.push(toSafeCodeFenceMarkdown(String(snippet?.code || ''), lang));
-      });
-    }
-
+    const lines = ['### 변경 Diff'];
+    fileDiffBlocks.forEach((entry) => {
+      lines.push('', `#### ${toCodeFileMarkdownLink(entry.file)}`);
+      lines.push(toSafeCodeFenceMarkdown(entry.diff, ''));
+    });
     return lines.join('\n');
   }
 
@@ -7570,18 +7506,27 @@
   }
 
   function renderAIBody(msg, opts = {}) {
+    // 렌더링 캐시: 동일 content + activeTab 조합이면 이전 HTML 재사용
+    const cacheKey = msg.content + '|' + (opts?.activeTab || 'answer');
+    const cached = getCachedRender(cacheKey);
+    if (cached) return cached;
+
+    let html;
     if (msg.profileId === 'codex' && msg.content) {
       const sections = parseCodexOutput(msg.content);
       updateCodexRuntimeInfo(sections);
       if (sections.response.content || sections.thinking.content) {
-        return renderCodexStructured(sections, {
+        html = renderCodexStructured(sections, {
           rawText: msg.content,
           activeTab: opts?.activeTab,
           actualCodeDiffs: Array.isArray(msg.actualCodeDiffs) ? msg.actualCodeDiffs : [],
         });
       }
     }
-    return renderMarkdown(msg.content);
+    if (!html) html = renderMarkdown(msg.content);
+
+    setCachedRender(cacheKey, html);
+    return html;
   }
 
   function isMessagesNearBottom(threshold = MESSAGE_SCROLL_BOTTOM_THRESHOLD) {
@@ -7667,14 +7612,20 @@
       $btnStop.classList.remove('hidden');
     }
 
+    // 서브커맨드 스트리밍 렌더링 스로틀 (성능 최적화)
+    const scheduleSubRender = createThrottledInvoker(STREAM_RENDER_THROTTLE_MS, () => {
+      if (finished || convId !== activeConvId) return;
+      bodyEl.innerHTML = renderMarkdown(fullOutput);
+      scrollToBottom();
+    });
+
     const unsubStream = window.electronAPI.cli.onStream(({ id, chunk }) => {
       if (id !== streamId || finished) return;
       fullOutput = appendStreamingChunk(fullOutput, chunk);
       aiMsg.content = fullOutput;
       autoSaveIfNeeded();
       if (convId !== activeConvId) return;
-      bodyEl.innerHTML = renderMarkdown(fullOutput);
-      scrollToBottom();
+      scheduleSubRender();
     });
 
     const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
@@ -7689,6 +7640,7 @@
     function finish() {
       if (finished) return;
       finished = true;
+      scheduleSubRender.flush();
       convStreams.delete(convId);
       unsubStream();
       unsubDone();
@@ -8724,10 +8676,10 @@
     const confirmed = window.confirm(`대화 ${conversations.length}개를 모두 삭제할까요?\n이 작업은 되돌릴 수 없습니다.`);
     if (!confirmed) return;
     conversations = [];
+    _rebuildConvMap();
     activeConvId = null;
     saveConversations();
     renderMessages();
-    renderHistory();
     syncStreamingUI();
   });
 
