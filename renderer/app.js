@@ -46,7 +46,8 @@
         });
       const cwd = typeof item.cwd === 'string' ? item.cwd : '';
       const codexSessionId = typeof item.codexSessionId === 'string' ? item.codexSessionId : null;
-      normalized.push({ id, title, messages, profileId, cwd, codexSessionId });
+      const lastCodexApprovalPolicy = typeof item.lastCodexApprovalPolicy === 'string' ? item.lastCodexApprovalPolicy : '';
+      normalized.push({ id, title, messages, profileId, cwd, codexSessionId, lastCodexApprovalPolicy });
     }
     return normalized;
   }
@@ -832,11 +833,6 @@
   let codexLimitSnapshot = loadCodexLimitSnapshot();
   let codexRuntimeInfo = loadCodexRuntimeInfo();
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
-  let approvalPolicy = localStorage.getItem('codexApprovalPolicy') || 'auto-approve';
-
-  // === 파일 첨부 상태 ===
-  let pendingAttachments = []; // { fileType, fileName, path, content, base64, dataUrl, mimeType, size }
-
   const APPROVAL_POLICY_OPTIONS = ['auto-approve', 'on-failure-or-unsafe', 'unless-allow-listed', 'always-prompt'];
   const APPROVAL_POLICY_LABELS = {
     'auto-approve': '자동 승인 (기본)',
@@ -844,6 +840,35 @@
     'unless-allow-listed': '허용 목록 외 확인',
     'always-prompt': '항상 확인',
   };
+  function normalizeApprovalPolicy(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (APPROVAL_POLICY_OPTIONS.includes(normalized)) return normalized;
+    if (normalized === 'on-request' || normalized === 'on-failure') return 'on-failure-or-unsafe';
+    if (normalized === 'untrusted') return 'unless-allow-listed';
+    if (normalized === 'never') return 'on-failure-or-unsafe';
+    return 'auto-approve';
+  }
+  let approvalPolicy = normalizeApprovalPolicy(localStorage.getItem('codexApprovalPolicy'));
+  localStorage.setItem('codexApprovalPolicy', approvalPolicy);
+  const pendingRuntimeResetByConv = new Map();
+
+  // === 파일 첨부 상태 ===
+  let pendingAttachments = []; // { fileType, fileName, path, content, base64, dataUrl, mimeType, size }
+
+  function queueRuntimeSessionReset(reason) {
+    const conv = getActiveConversation();
+    if (!conv || !conv.id || !conv.codexSessionId) return false;
+    pendingRuntimeResetByConv.set(conv.id, String(reason || '런타임 정책 변경'));
+    return true;
+  }
+
+  function consumeRuntimeSessionReset(convId) {
+    const key = String(convId || '');
+    if (!key) return '';
+    const reason = pendingRuntimeResetByConv.get(key) || '';
+    if (reason) pendingRuntimeResetByConv.delete(key);
+    return reason;
+  }
 
   // === 컨텍스트 압축 설정 ===
   const CONTEXT_COMPRESSION_KEY = 'contextCompressionEnabled';
@@ -975,6 +1000,7 @@
     })];
     // 세션 ID 초기화 (새 세션으로 압축된 컨텍스트 전송)
     conv.codexSessionId = null;
+    conv.lastCodexApprovalPolicy = '';
     saveConversations();
 
     return {
@@ -1682,16 +1708,31 @@
       updateRuntimeHint();
     }
     if (type === 'sandbox' && SANDBOX_OPTIONS.includes(value)) {
+      const changed = sandboxMode !== value;
       sandboxMode = value;
       localStorage.setItem('codexSandboxMode', sandboxMode);
+      const queuedReset = changed ? queueRuntimeSessionReset('샌드박스 정책 변경') : false;
       updateRuntimeHint();
-      showSlashFeedback(`샌드박스 모드: ${SANDBOX_LABELS[value] || value}`, false);
+      showSlashFeedback(
+        queuedReset
+          ? `샌드박스 모드: ${SANDBOX_LABELS[value] || value} (다음 요청부터 새 세션으로 적용)`
+          : `샌드박스 모드: ${SANDBOX_LABELS[value] || value}`,
+        false
+      );
     }
     if (type === 'approval' && APPROVAL_POLICY_OPTIONS.includes(value)) {
-      approvalPolicy = value;
+      const normalizedValue = normalizeApprovalPolicy(value);
+      const changed = approvalPolicy !== normalizedValue;
+      approvalPolicy = normalizedValue;
       localStorage.setItem('codexApprovalPolicy', approvalPolicy);
+      const queuedReset = changed ? queueRuntimeSessionReset('승인 정책 변경') : false;
       updateRuntimeHint();
-      showSlashFeedback(`승인 정책: ${APPROVAL_POLICY_LABELS[value] || value}`, false);
+      showSlashFeedback(
+        queuedReset
+          ? `승인 정책: ${APPROVAL_POLICY_LABELS[approvalPolicy] || approvalPolicy} (다음 요청부터 새 세션으로 적용)`
+          : `승인 정책: ${APPROVAL_POLICY_LABELS[approvalPolicy] || approvalPolicy}`,
+        false
+      );
     }
     if (type === 'context') {
       if (value === 'compress-toggle') {
@@ -1787,6 +1828,22 @@
     return null;
   }
 
+  function normalizeCliApprovalPolicy(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'on-failure') return 'on-request';
+    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'never') return normalized;
+    return '';
+  }
+
+  function extractApprovalPolicyFromText(text) {
+    const source = String(text || '');
+    const fromJson = source.match(/"approval_policy"\s*:\s*"([^"]+)"/i);
+    if (fromJson && fromJson[1]) return normalizeCliApprovalPolicy(fromJson[1]);
+    const fromLine = source.match(/^approval\s*:\s*(\S+)/im);
+    if (fromLine && fromLine[1]) return normalizeCliApprovalPolicy(fromLine[1]);
+    return '';
+  }
+
   function createThrottledInvoker(intervalMs, fn) {
     const minInterval = Math.max(16, Number(intervalMs) || 70);
     let timer = null;
@@ -1842,7 +1899,8 @@
     if (normalized === 'on-failure-or-unsafe') return 'on-request';
     if (normalized === 'unless-allow-listed') return 'untrusted';
     if (normalized === 'always-prompt') return 'untrusted';
-    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') {
+    if (normalized === 'never') return 'on-request';
+    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'on-failure') {
       return normalized;
     }
     return 'on-request';
@@ -1856,29 +1914,30 @@
       args.push('resume', sessionId);
     }
     args.push('--skip-git-repo-check');
+
     // sandbox 모드에 따라 실행 방식 결정
+    // -a (approval), -s (sandbox)는 글로벌 옵션이므로 exec 앞에 배치해야 한다.
     if (sandboxMode === 'danger-full-access') {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else if (approvalPolicy === 'auto-approve') {
-      // 자동 승인: --full-auto
-      if (!isResume && sandboxMode === 'read-only') {
-        args.push('--full-auto', '--sandbox', 'read-only');
-      } else {
-        args.push('--full-auto');
+      // 자동 승인: --full-auto (= -a on-request + --sandbox workspace-write)
+      args.push('--full-auto');
+      // full-auto 기본이 workspace-write이므로, read-only를 원하면 별도 지정
+      if (sandboxMode === 'read-only') {
+        globalArgs.push('-s', 'read-only');
       }
     } else {
-      // 수동 승인 정책
-      if (!isResume) {
-        // 최신 Codex CLI는 승인 정책을 글로벌 옵션(-a/--ask-for-approval)으로만 지원한다.
-        const approvalFlag = resolveCodexApprovalFlag(approvalPolicy);
-        if (approvalFlag) {
-          globalArgs.push('-a', approvalFlag);
-        }
-        if (sandboxMode === 'read-only') {
-          args.push('--sandbox', 'read-only');
-        }
+      // 수동 승인 정책: 글로벌 -a와 -s로 전달
+      const approvalFlag = resolveCodexApprovalFlag(approvalPolicy);
+      if (approvalFlag) {
+        globalArgs.push('-a', approvalFlag);
       }
-      // resume에서는 sandbox 플래그를 전달하지 않고 CLI 세션 저장 값을 사용
+      // sandbox 모드도 글로벌 -s로 전달 (resume에서도 동작)
+      if (sandboxMode === 'read-only') {
+        globalArgs.push('-s', 'read-only');
+      } else if (sandboxMode === 'workspace-write') {
+        globalArgs.push('-s', 'workspace-write');
+      }
     }
     args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
@@ -1890,7 +1949,11 @@
     } else {
       args.push('-c', 'model_reasoning_effort=xhigh');
     }
-    return [...globalArgs, ...args];
+    const built = [...globalArgs, ...args];
+    try {
+      console.log(`[codex-args] approvalPolicy=${approvalPolicy} approvalFlag=${resolveCodexApprovalFlag(approvalPolicy) || 'auto'} isResume=${isResume} args=${JSON.stringify(built)}`);
+    } catch { /* ignore */ }
+    return built;
   }
 
   function mergeCodexExecArgsWithGlobalFlags(baseArgs, extraArgs) {
@@ -2180,6 +2243,7 @@
 
     const resolvedSessionId = typeof data.id === 'string' && data.id ? data.id : sid;
     conv.codexSessionId = resolvedSessionId;
+    conv.lastCodexApprovalPolicy = '';
     const loadedTitle = typeof data.title === 'string' ? data.title.trim() : '';
     const fallbackTitle = options.title || `세션 ${resolvedSessionId.slice(0, 8)}`;
     conv.title = loadedTitle || fallbackTitle;
@@ -2470,6 +2534,7 @@
     }
     if (conv) {
       conv.codexSessionId = item.sessionId;
+      conv.lastCodexApprovalPolicy = '';
       if (!conv.title) conv.title = `세션 ${item.sessionId.slice(0, 8)}`;
       saveConversations();
       renderMessages();
@@ -2936,6 +3001,7 @@
       }
       const conv = getActiveConversation();
       conv.codexSessionId = sessionArg;
+      conv.lastCodexApprovalPolicy = '';
       saveConversations();
       const modeLabel = restoreMode === 'raw' ? '원본 로그' : '일반';
       showSlashFeedback(`세션 복원 실패[${modeLabel}], ID만 설정했습니다: ${sessionArg}`, true);
@@ -3520,6 +3586,7 @@
     const idx = conversations.findIndex(c => c.id === id);
     if (idx < 0) return;
 
+    pendingRuntimeResetByConv.delete(id);
     const removingActive = activeConvId === id;
     conversations.splice(idx, 1);
     _convMap.delete(id);
@@ -3580,6 +3647,7 @@
       profileId: activeProfileId,
       cwd: currentCwd,
       codexSessionId: null,
+      lastCodexApprovalPolicy: '',
     };
     conversations.unshift(conv);
     _convMap.set(conv.id, conv);
@@ -5165,8 +5233,10 @@
         const payload = obj.payload || {};
         if (typeof payload.model === 'string' && payload.model) appendUniqueLine(sessionLines, `model: ${payload.model}`);
         if (typeof payload.cwd === 'string' && payload.cwd) appendUniqueLine(sessionLines, `workdir: ${payload.cwd}`);
-        if (typeof payload.approval_policy === 'string' && payload.approval_policy) appendUniqueLine(sessionLines, `approval: ${payload.approval_policy}`);
-        if (typeof payload?.sandbox_policy?.type === 'string' && payload.sandbox_policy.type) appendUniqueLine(sessionLines, `sandbox: ${payload.sandbox_policy.type}`);
+        // approval/sandbox는 CLI 보고값 대신 앱의 현재 설정을 사용 (CLI가 config 기본값을 보고하는 문제 방지)
+        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'auto (full-auto)';
+        appendUniqueLine(sessionLines, `approval: ${effectiveApproval}`);
+        appendUniqueLine(sessionLines, `sandbox: ${sandboxMode}`);
         continue;
       }
 
@@ -5515,6 +5585,18 @@
       jsonSections.response.raw = String(jsonSections.response.raw || jsonSections.response.content || '');
       jsonSections.response.content = sanitizeFinalAnswerText(cleanCodexResponse(jsonSections.response.content || ''));
       for (const key in jsonSections) jsonSections[key].content = String(jsonSections[key].content || '').trim();
+
+      // 세션 섹션에 현재 앱의 approval/sandbox 설정이 없으면 주입
+      // (CLI가 turn_context를 출력하지 않는 경우에도 사용자가 확인 가능)
+      const sessionContent = jsonSections.session.content || '';
+      if (!/^approval\s*:/im.test(sessionContent)) {
+        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'auto (full-auto)';
+        jsonSections.session.content = (sessionContent ? sessionContent + '\n' : '') + `approval: ${effectiveApproval}`;
+      }
+      if (!/^sandbox\s*:/im.test(jsonSections.session.content)) {
+        jsonSections.session.content += `\nsandbox: ${sandboxMode}`;
+      }
+
       return jsonSections;
     }
 
@@ -5790,6 +5872,19 @@
     return { kind: 'progress', title: '진행 상태', detail: hint ? `작업을 진행 중입니다. ${hint}` : '작업 단계를 순차적으로 진행 중입니다.' };
   }
 
+  // 세션 메타 JSON 이벤트: 과정 탭에서 제외 (세션 섹션에서 처리됨)
+  const _SESSION_META_EVENT_TYPES = new Set([
+    'thread.started', 'turn.started', 'turn.completed', 'turn.failed',
+    'turn_context', 'session_meta',
+  ]);
+  function _isSessionMetaJsonLine(line) {
+    if (!line.startsWith('{')) return false;
+    try {
+      const obj = JSON.parse(line);
+      return _SESSION_META_EVENT_TYPES.has(String(obj.type || '').toLowerCase());
+    } catch { return false; }
+  }
+
   function buildProcessEntriesFromRawLines(rawLines) {
     const entries = [];
     for (const rawLine of Array.isArray(rawLines) ? rawLines : []) {
@@ -5799,6 +5894,8 @@
       if (isPromptMetaLine(line)) continue;
       if (/^(OpenAI\s+Codex|Model:|Directory:|Approval:|Sandbox:|Reasoning effort:|tokens?\s+used|token(?:s)?\s*usage|mcp:|codex)$/i.test(line)) continue;
       if (/^[─━\-]{8,}$/.test(line)) continue;
+      // 세션/턴 메타 JSON 이벤트는 과정 탭에서 제외 (approval_policy 등이 표시되는 것 방지)
+      if (_isSessionMetaJsonLine(line)) continue;
 
       const normalized = normalizeProcessLine(line);
       if (!normalized) continue;
@@ -7863,14 +7960,30 @@
     const profile = PROFILES.find(p => p.id === activeProfileId);
 
     // === 자동 컨텍스트 압축 ===
-    const useCompression = !forceNewSession && shouldAutoCompress(conv);
-    let sessionIdForExtraRun = forceNewSession ? null : conv?.codexSessionId;
+    const runtimeResetReason = forceNewSession ? '' : consumeRuntimeSessionReset(conv?.id);
+    const expectedCliApproval = resolveCodexApprovalFlag(approvalPolicy);
+    const lastCliApproval = normalizeCliApprovalPolicy(conv?.lastCodexApprovalPolicy || '');
+    const needsApprovalResync = !forceNewSession
+      && Boolean(expectedCliApproval)
+      && Boolean(conv?.codexSessionId)
+      && (!lastCliApproval || lastCliApproval !== expectedCliApproval);
+    const shouldResetRuntimeSession = !forceNewSession
+      && Boolean(conv?.codexSessionId)
+      && (Boolean(runtimeResetReason) || needsApprovalResync);
+    const effectiveResetReason = runtimeResetReason || (needsApprovalResync ? '승인 정책 동기화' : '');
+    const useCompression = !forceNewSession && (shouldResetRuntimeSession || shouldAutoCompress(conv));
+    let sessionIdForExtraRun = (forceNewSession || shouldResetRuntimeSession) ? null : conv?.codexSessionId;
     let runPrompt;
 
     if (useCompression) {
       runPrompt = buildCompressedPrompt(conv, buildCodexPrompt(promptText));
       sessionIdForExtraRun = null;
-      console.log(`[context-compress] auto-compress in extraArgs: ${conv.messages.length} msgs`);
+      if (shouldResetRuntimeSession) {
+        console.log(`[runtime-reset] ${effectiveResetReason}: start new session with compressed context`);
+        showSlashFeedback(`${effectiveResetReason}: 다음 요청부터 새 세션으로 적용`, false);
+      } else {
+        console.log(`[context-compress] auto-compress in extraArgs: ${conv.messages.length} msgs`);
+      }
     } else {
       runPrompt = buildCodexPrompt(promptText);
     }
@@ -8075,6 +8188,8 @@
       const finalSections = parseCodexOutput(aiMsg.content || '');
       const sid = extractCodexSessionId(finalSections);
       if (sid) conv.codexSessionId = sid;
+      const observedApproval = extractApprovalPolicyFromText(aiMsg.content || '');
+      if (observedApproval) conv.lastCodexApprovalPolicy = observedApproval;
 
       // 토큰 사용량 기록
       const usage = resolveCodexTurnUsage(runPrompt, aiMsg.content || '');
@@ -8130,6 +8245,9 @@
         cwd: currentCwd,
       });
       if (!runResult?.success) {
+        if (shouldResetRuntimeSession && conv?.id) {
+          pendingRuntimeResetByConv.set(conv.id, effectiveResetReason || '런타임 정책 변경');
+        }
         aiMsg.content = `실행 실패: ${runResult?.error || 'unknown'}`;
         aiMsg.role = 'error';
         const errBody = resolveBodyEl();
@@ -8137,6 +8255,9 @@
         finishStream();
       }
     } catch (err) {
+      if (shouldResetRuntimeSession && conv?.id) {
+        pendingRuntimeResetByConv.set(conv.id, effectiveResetReason || '런타임 정책 변경');
+      }
       aiMsg.content = `오류: ${err.message}`;
       aiMsg.role = 'error';
       const errBody = resolveBodyEl();
@@ -8267,15 +8388,28 @@
 
     // === 자동 컨텍스트 압축 ===
     // 메시지 수가 임계값을 초과하면 압축 모드로 전환하여 토큰 절약
-    const useCompression = shouldAutoCompress(conv);
+    const runtimeResetReason = consumeRuntimeSessionReset(conv?.id);
+    const expectedCliApproval = resolveCodexApprovalFlag(approvalPolicy);
+    const lastCliApproval = normalizeCliApprovalPolicy(conv?.lastCodexApprovalPolicy || '');
+    const needsApprovalResync = Boolean(expectedCliApproval)
+      && Boolean(conv?.codexSessionId)
+      && (!lastCliApproval || lastCliApproval !== expectedCliApproval);
+    const shouldResetRuntimeSession = Boolean(conv?.codexSessionId) && (Boolean(runtimeResetReason) || needsApprovalResync);
+    const effectiveResetReason = runtimeResetReason || (needsApprovalResync ? '승인 정책 동기화' : '');
+    const useCompression = shouldResetRuntimeSession || shouldAutoCompress(conv);
     let runPrompt;
-    let sessionIdForRun = conv.codexSessionId;
+    let sessionIdForRun = shouldResetRuntimeSession ? null : conv.codexSessionId;
 
     if (useCompression) {
       // 압축: 이전 대화를 요약하고 새 세션으로 시작
       runPrompt = buildCompressedPrompt(conv, buildCodexPrompt(promptText));
       sessionIdForRun = null; // 새 세션 시작 (요약된 컨텍스트로)
-      console.log(`[context-compress] auto-compress triggered: ${conv.messages.length} messages → compressed prompt`);
+      if (shouldResetRuntimeSession) {
+        console.log(`[runtime-reset] ${effectiveResetReason}: start new session with compressed context`);
+        showSlashFeedback(`${effectiveResetReason}: 다음 요청부터 새 세션으로 적용`, false);
+      } else {
+        console.log(`[context-compress] auto-compress triggered: ${conv.messages.length} messages → compressed prompt`);
+      }
     } else {
       runPrompt = buildCodexPrompt(promptText);
     }
@@ -8501,6 +8635,8 @@
       const finalSections = parseCodexOutput(aiMsg.content || '');
       const sid = extractCodexSessionId(finalSections);
       if (sid) conv.codexSessionId = sid;
+      const observedApproval = extractApprovalPolicyFromText(aiMsg.content || '');
+      if (observedApproval) conv.lastCodexApprovalPolicy = observedApproval;
 
       // 토큰 사용량 기록
       const usage = resolveCodexTurnUsage(promptText, aiMsg.content || '');
@@ -8561,6 +8697,9 @@
       });
 
       if (!runResult?.success) {
+        if (shouldResetRuntimeSession && conv?.id) {
+          pendingRuntimeResetByConv.set(conv.id, effectiveResetReason || '런타임 정책 변경');
+        }
         aiMsg.content = `CLI 실행 실패: ${runResult?.error || 'unknown error'}`;
         aiMsg.role = 'error';
         const errEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
@@ -8570,6 +8709,9 @@
         finishStream();
       }
     } catch (error) {
+      if (shouldResetRuntimeSession && conv?.id) {
+        pendingRuntimeResetByConv.set(conv.id, effectiveResetReason || '런타임 정책 변경');
+      }
       aiMsg.content = `CLI 실행 오류: ${error?.message || String(error)}`;
       aiMsg.role = 'error';
       const errEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;

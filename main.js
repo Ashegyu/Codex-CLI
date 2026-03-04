@@ -576,6 +576,29 @@ function createProcessHandle(kind, proc) {
   };
 }
 
+function sanitizeCliEnv(rawEnv) {
+  const source = { ...(rawEnv || {}) };
+  const env = {};
+  const allow = new Set([
+    'PATH', 'PATHEXT', 'SYSTEMROOT', 'COMSPEC', 'WINDIR',
+    'TEMP', 'TMP', 'USERPROFILE', 'HOMEDRIVE', 'HOMEPATH',
+    'APPDATA', 'LOCALAPPDATA', 'PROGRAMDATA',
+    'PROGRAMFILES', 'PROGRAMFILES(X86)', 'PROGRAMW6432',
+    'OS', 'USERNAME', 'USERDOMAIN',
+    'NUMBER_OF_PROCESSORS', 'PROCESSOR_ARCHITECTURE', 'PROCESSOR_IDENTIFIER',
+    'TERM', 'WT_SESSION', 'LANG', 'LC_ALL',
+    'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+    'OPENAI_API_KEY', 'OPENAI_BASE_URL', 'OPENAI_ORG_ID', 'OPENAI_PROJECT_ID',
+  ]);
+
+  for (const [key, value] of Object.entries(source)) {
+    const upper = String(key || '').toUpperCase();
+    if (!allow.has(upper)) continue;
+    env[key] = value;
+  }
+  return env;
+}
+
 function resolveCodexDirectInvocation(commandName, resolvedShell) {
   const command = String(commandName || '').trim().toLowerCase();
   if (command !== 'codex') return null;
@@ -610,9 +633,7 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
   console.log(`[CLI] run id=${id} shell=${shell} args=${JSON.stringify(args)} cwd=${runCwd}`);
 
   try {
-    const env = { ...process.env, ...(profile.env || {}), FORCE_COLOR: '0' };
-    delete env.CLAUDECODE;
-    delete env.CLAUDE_CODE;
+    const env = sanitizeCliEnv({ ...process.env, ...(profile.env || {}), FORCE_COLOR: '0' });
 
     // CLI 경로 자동 탐색 (npm global, PATH 등)
     const resolvedShell = resolveCliPath(shell);
