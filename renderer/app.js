@@ -733,6 +733,7 @@
   const $modelHint = document.getElementById('current-model-name');
   const $planModeHint = document.getElementById('current-plan-mode');
   const $sandboxHint = document.getElementById('current-sandbox-mode');
+  const $interactiveHint = document.getElementById('current-interactive-mode');
   const $approvalHint = document.getElementById('current-approval-policy');
   const $contextHint = document.getElementById('context-compress-hint');
   const $btnAttach = document.getElementById('btn-attach');
@@ -773,6 +774,7 @@
     { command: '/model', description: '모델 변경', usage: '/model [모델명]' },
     { command: '/reasoning', description: 'Reasoning effort 변경', usage: '/reasoning [low|medium|high|extra high]' },
     { command: '/sandbox', description: '샌드박스 모드 변경', usage: '/sandbox [read-only|workspace-write|danger-full-access]' },
+    { command: '/interactive', description: '실행 모드 변경 (on=interactive, off=exec)', usage: '/interactive [on|off]' },
     { command: '/cwd', description: '작업 폴더 변경', usage: '/cwd [경로]' },
     // --- 앱 기능 ---
     { command: '/file', description: '파일 불러오기', usage: '/file [경로]' },
@@ -832,6 +834,8 @@
   let slashFeedbackTimer = null;
   let codexLimitSnapshot = loadCodexLimitSnapshot();
   let codexRuntimeInfo = loadCodexRuntimeInfo();
+  let codexExecutionMode = localStorage.getItem('codexExecutionMode') === 'interactive' ? 'interactive' : 'exec';
+  localStorage.setItem('codexExecutionMode', codexExecutionMode);
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
   const APPROVAL_POLICY_OPTIONS = ['auto-approve', 'on-failure-or-unsafe', 'unless-allow-listed', 'always-prompt'];
   const APPROVAL_POLICY_LABELS = {
@@ -840,6 +844,11 @@
     'unless-allow-listed': '허용 목록 외 확인',
     'always-prompt': '항상 확인',
   };
+  const INTERACTIVE_MODE_OPTIONS = ['on', 'off'];
+  const INTERACTIVE_MODE_LABELS = {
+    on: 'ON (codex interactive)',
+    off: 'OFF (codex exec)',
+  };
   function normalizeApprovalPolicy(value) {
     const normalized = String(value || '').trim().toLowerCase();
     if (APPROVAL_POLICY_OPTIONS.includes(normalized)) return normalized;
@@ -847,6 +856,13 @@
     if (normalized === 'untrusted') return 'unless-allow-listed';
     if (normalized === 'never') return 'on-failure-or-unsafe';
     return 'auto-approve';
+  }
+  function resolveInteractiveMode(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    return normalized === 'interactive' ? 'on' : 'off';
+  }
+  function resolveExecutionModeFromInteractiveMode(mode) {
+    return mode === 'on' ? 'interactive' : 'exec';
   }
   let approvalPolicy = normalizeApprovalPolicy(localStorage.getItem('codexApprovalPolicy'));
   localStorage.setItem('codexApprovalPolicy', approvalPolicy);
@@ -1664,6 +1680,10 @@
       options = SANDBOX_OPTIONS;
       currentValue = sandboxMode;
       labelFn = opt => SANDBOX_LABELS[opt] || opt;
+    } else if (type === 'interactive') {
+      options = INTERACTIVE_MODE_OPTIONS;
+      currentValue = resolveInteractiveMode(codexExecutionMode);
+      labelFn = opt => INTERACTIVE_MODE_LABELS[opt] || opt;
     } else if (type === 'approval') {
       options = APPROVAL_POLICY_OPTIONS;
       currentValue = approvalPolicy;
@@ -1719,6 +1739,22 @@
           : `샌드박스 모드: ${SANDBOX_LABELS[value] || value}`,
         false
       );
+    }
+    if (type === 'interactive' && INTERACTIVE_MODE_OPTIONS.includes(value)) {
+      const nextMode = resolveExecutionModeFromInteractiveMode(value);
+      const changed = codexExecutionMode !== nextMode;
+      codexExecutionMode = nextMode;
+      localStorage.setItem('codexExecutionMode', codexExecutionMode);
+      const queuedReset = changed ? queueRuntimeSessionReset('실행 모드 변경') : false;
+      updateRuntimeHint();
+      showSlashFeedback(
+        queuedReset
+          ? `인터랙티브 모드: ${value.toUpperCase()} (다음 요청부터 새 세션으로 적용)`
+          : `인터랙티브 모드: ${value.toUpperCase()}`,
+        false
+      );
+      closeRuntimeMenu();
+      return;
     }
     if (type === 'approval' && APPROVAL_POLICY_OPTIONS.includes(value)) {
       const normalizedValue = normalizeApprovalPolicy(value);
@@ -1779,6 +1815,10 @@
     }
     if ($sandboxHint) {
       $sandboxHint.textContent = `샌드박스: ${SANDBOX_LABELS[sandboxMode] || sandboxMode}`;
+    }
+    if ($interactiveHint) {
+      const interactiveMode = resolveInteractiveMode(codexExecutionMode);
+      $interactiveHint.textContent = `인터랙티브: ${interactiveMode.toUpperCase()}`;
     }
     if ($approvalHint) {
       $approvalHint.textContent = `승인: ${APPROVAL_POLICY_LABELS[approvalPolicy] || approvalPolicy}`;
@@ -1895,39 +1935,43 @@
 
   function resolveCodexApprovalFlag(policy) {
     const normalized = String(policy || '').trim().toLowerCase();
-    if (!normalized || normalized === 'auto-approve') return null;
+    if (!normalized || normalized === 'auto-approve') return 'never';
     if (normalized === 'on-failure-or-unsafe') return 'on-request';
     if (normalized === 'unless-allow-listed') return 'untrusted';
-    if (normalized === 'always-prompt') return 'untrusted';
-    if (normalized === 'never') return 'on-request';
-    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'on-failure') {
+    if (normalized === 'always-prompt') return 'on-request';
+    if (normalized === 'never') return 'never';
+    if (normalized === 'on-request' || normalized === 'untrusted' || normalized === 'on-failure' || normalized === 'never') {
       return normalized;
     }
     return 'on-request';
   }
 
-  function buildCodexArgs(sessionId) {
+  function buildCodexArgs(sessionId, options = {}) {
+    const forceExec = options?.forceExec === true;
+    const effectiveMode = forceExec ? 'exec' : codexExecutionMode;
     const globalArgs = [];
-    const args = ['exec'];
+    const args = [];
     const isResume = !!sessionId;
-    if (isResume) {
-      args.push('resume', sessionId);
+    if (effectiveMode === 'exec') {
+      args.push('exec');
+      if (isResume) {
+        args.push('resume', sessionId);
+      }
+      args.push('--skip-git-repo-check');
+    } else {
+      if (isResume) {
+        args.push('resume', sessionId);
+      }
+      // interactive TUI를 인라인 출력으로 실행하여 앱 내 스트림에 표시
+      globalArgs.push('--no-alt-screen');
     }
-    args.push('--skip-git-repo-check');
 
     // sandbox 모드에 따라 실행 방식 결정
     // -a (approval), -s (sandbox)는 글로벌 옵션이므로 exec 앞에 배치해야 한다.
     if (sandboxMode === 'danger-full-access') {
       args.push('--dangerously-bypass-approvals-and-sandbox');
-    } else if (approvalPolicy === 'auto-approve') {
-      // 자동 승인: --full-auto (= -a on-request + --sandbox workspace-write)
-      args.push('--full-auto');
-      // full-auto 기본이 workspace-write이므로, read-only를 원하면 별도 지정
-      if (sandboxMode === 'read-only') {
-        globalArgs.push('-s', 'read-only');
-      }
     } else {
-      // 수동 승인 정책: 글로벌 -a와 -s로 전달
+      // 승인 정책: 글로벌 -a와 -s로 전달
       const approvalFlag = resolveCodexApprovalFlag(approvalPolicy);
       if (approvalFlag) {
         globalArgs.push('-a', approvalFlag);
@@ -1939,7 +1983,9 @@
         globalArgs.push('-s', 'workspace-write');
       }
     }
-    args.push('--json');
+    if (effectiveMode === 'exec') {
+      args.push('--json');
+    }
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
     const effort = normalizeReasoning(codexRuntimeInfo.reasoning);
     if (effort === 'extra high') {
@@ -1951,7 +1997,7 @@
     }
     const built = [...globalArgs, ...args];
     try {
-      console.log(`[codex-args] approvalPolicy=${approvalPolicy} approvalFlag=${resolveCodexApprovalFlag(approvalPolicy) || 'auto'} isResume=${isResume} args=${JSON.stringify(built)}`);
+      console.log(`[codex-args] mode=${effectiveMode} approvalPolicy=${approvalPolicy} approvalFlag=${resolveCodexApprovalFlag(approvalPolicy) || 'auto'} isResume=${isResume} args=${JSON.stringify(built)}`);
     } catch { /* ignore */ }
     return built;
   }
@@ -1982,6 +2028,11 @@
     }
 
     return [...globalFlags, ...base, ...execFlags];
+  }
+
+  function resolveCodexProcessMode(options = {}) {
+    if (options?.forcePipe) return 'pipe';
+    return codexExecutionMode === 'interactive' ? 'pty' : 'pipe';
   }
 
   function buildCodexPrompt(promptText) {
@@ -3029,6 +3080,22 @@
       return true;
     }
 
+    if (command === '/interactive') {
+      if (argText) {
+        const normalizedArg = argText.toLowerCase();
+        if (normalizedArg === 'on' || normalizedArg === 'true' || normalizedArg === '1' || normalizedArg === 'interactive') {
+          setRuntimeOption('interactive', 'on');
+        } else if (normalizedArg === 'off' || normalizedArg === 'false' || normalizedArg === '0' || normalizedArg === 'exec' || normalizedArg === 'auto') {
+          setRuntimeOption('interactive', 'off');
+        } else {
+          showSlashFeedback('사용법: /interactive [on|off] (on=interactive, off=exec)', true);
+        }
+      } else {
+        renderRuntimeMenu('interactive');
+      }
+      return true;
+    }
+
     if (command === '/fork') {
       const sessionArg = argText || '';
       showSlashFeedback('세션을 복제하여 실행합니다...', false);
@@ -3310,6 +3377,14 @@
       e.preventDefault();
       e.stopPropagation();
       renderRuntimeMenu('sandbox');
+    });
+  }
+
+  if ($interactiveHint) {
+    $interactiveHint.addEventListener('click', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      renderRuntimeMenu('interactive');
     });
   }
 
@@ -5234,7 +5309,7 @@
         if (typeof payload.model === 'string' && payload.model) appendUniqueLine(sessionLines, `model: ${payload.model}`);
         if (typeof payload.cwd === 'string' && payload.cwd) appendUniqueLine(sessionLines, `workdir: ${payload.cwd}`);
         // approval/sandbox는 CLI 보고값 대신 앱의 현재 설정을 사용 (CLI가 config 기본값을 보고하는 문제 방지)
-        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'auto (full-auto)';
+        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'never (auto-approve)';
         appendUniqueLine(sessionLines, `approval: ${effectiveApproval}`);
         appendUniqueLine(sessionLines, `sandbox: ${sandboxMode}`);
         continue;
@@ -5590,7 +5665,7 @@
       // (CLI가 turn_context를 출력하지 않는 경우에도 사용자가 확인 가능)
       const sessionContent = jsonSections.session.content || '';
       if (!/^approval\s*:/im.test(sessionContent)) {
-        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'auto (full-auto)';
+        const effectiveApproval = resolveCodexApprovalFlag(approvalPolicy) || 'never (auto-approve)';
         jsonSections.session.content = (sessionContent ? sessionContent + '\n' : '') + `approval: ${effectiveApproval}`;
       }
       if (!/^sandbox\s*:/im.test(jsonSections.session.content)) {
@@ -7911,7 +7986,8 @@
     if (normalizedSubcommand === '--version') {
       cliArgs = ['--version'];
     } else if (normalizedSubcommand === 'review') {
-      cliArgs = [...buildCodexArgs(null), 'review', ...(Array.isArray(extraArgs) ? extraArgs : [])];
+      // review는 비대화형 경로를 유지한다.
+      cliArgs = [...buildCodexArgs(null, { forceExec: true }), 'review', ...(Array.isArray(extraArgs) ? extraArgs : [])];
     } else {
       cliArgs = [subcommand, ...(Array.isArray(extraArgs) ? extraArgs : [])];
     }
@@ -8238,7 +8314,7 @@
         profile: {
           command: profile.command,
           args: mergedArgs,
-          mode: profile.mode,
+          mode: resolveCodexProcessMode(),
           env: {},
         },
         prompt: runPrompt,
@@ -8689,7 +8765,7 @@
         profile: {
           command: profile.command,
           args: buildCodexArgs(sessionIdForRun),
-          mode: profile.mode,
+          mode: resolveCodexProcessMode(),
           env: {},
         },
         prompt: runPrompt,

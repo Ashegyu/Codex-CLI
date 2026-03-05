@@ -626,9 +626,13 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
     ? [...(profile.args || []), '--', promptText]
     : [...(profile.args || [])];
   const runCwd = cwd || workingDirectory;
+  const requestedMode = String(profile?.mode || '').trim().toLowerCase();
+  const requestedPtyMode = requestedMode === 'pty' || requestedMode === 'interactive';
   const isJsonMode = args.some((arg) => String(arg).trim().toLowerCase() === '--json');
-  const forceSpawnMode = process.platform === 'win32' && String(shell || '').toLowerCase() === 'codex';
-  const useSpawnMode = isJsonMode || forceSpawnMode;
+  const forceSpawnMode = process.platform === 'win32'
+    && String(shell || '').toLowerCase() === 'codex'
+    && !requestedPtyMode;
+  const useSpawnMode = requestedPtyMode ? false : (isJsonMode || forceSpawnMode || requestedMode === 'pipe');
 
   console.log(`[CLI] run id=${id} shell=${shell} args=${JSON.stringify(args)} cwd=${runCwd}`);
 
@@ -639,7 +643,7 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
     const resolvedShell = resolveCliPath(shell);
 
     if (useSpawnMode) {
-      // JSONL 출력은 PTY 대신 pipe 기반 spawn으로 받아 줄바꿈/폭 래핑 손상을 방지한다.
+      // exec/pipe 모드는 PTY 대신 spawn으로 실행해 줄바꿈/폭 래핑 손상을 줄인다.
       const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(resolvedShell);
       let spawnCommand = resolvedShell;
       let spawnArgs = args;
