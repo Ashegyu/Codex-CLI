@@ -54,7 +54,13 @@
       "Bash(cd \"C:/Users/GC/Desktop/업무/JGKim/Claude CLI\" && npx electron-builder --win --config.directories.output=dist-temp21 2>&1)",
       "Bash(cd \"C:/Users/GC/Desktop/업무/JGKim/Claude CLI\" && npx electron-builder --win --config.directories.output=dist-temp22 2>&1)",
       "Bash(cd C:\\\\Users\\\\GC\\\\Desktop\\\\업무\\\\JGKim\\\\Claude CLI:*)",
-      "Bash(npm start:*)"
+      "Bash(npm start:*)",
+      "Bash(cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && npm run build 2>&1)",
+      "Bash(taskkill /F /IM \"CLI Chat.exe\" 2>&1; sleep 2 && cd \"C:\\\\Users\\\\GC\\\\Desktop\\\\Works\\\\Personal\\\\Claude CLI\" && npm run build 2>&1)",
+      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build 2>&1 | tail -20)",
+      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build 2>&1 | tail -5)",
+      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && sed -i 's/newConversation\\(undefined, { skipAutoSession: true }\\)/newConversation\\(\\)/g' renderer/app.js && sed -i 's/newConversation\\(mode\\)/newConversation\\(\\)/g' renderer/app.js && echo \"done\")",
+      "Bash(cd \"/c/Users/GC/Desktop/Works/Personal/Claude CLI\" && npm run build)"
     ]
   }
 }

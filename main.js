@@ -297,6 +297,14 @@ function classifyPtyLine(rawLine) {
   if (/^[─━═╌╍┄┅─]{5,}$/u.test(line) || /[█▓▒░]{3,}/u.test(line)) {
     return { kind: 'ignore', text: '' };
   }
+  // 배너 프레임 (유니코드 박스 문자로만 구성)
+  if (/^[╭╮╰╯┌┐└┘─│┃┄┈═╔╗╚╝║\s]+$/u.test(line)) {
+    return { kind: 'ignore', text: '' };
+  }
+  // 프롬프트 대기 마커
+  if (/^>\s*$/.test(line)) {
+    return { kind: 'ignore', text: '' };
+  }
 
   return { kind: 'content', text: raw.trimEnd() };
 }
@@ -308,29 +316,28 @@ function emitCliStream(id, payload) {
   }
 }
 
-// 턴 완료 감지: "tokens? used" 패턴 이후 숫자 줄 → 2초 무입력 시 턴 완료로 판정
+// 턴 완료 감지: 충분한 콘텐츠 출력 후 idle이면 턴 완료로 판정
 function detectTurnCompletion(buf, mainWindow, id) {
-  const text = buf.turnDetectBuffer;
-  // "X tokens" or "X tokens used" 패턴
-  if (buf.turnDetectState === 'idle') {
-    if (/\d[\d,]*\s*tokens?\b/i.test(text)) {
-      buf.turnDetectState = 'saw_tokens';
+  if (!buf.hasContentOutput) return;
+
+  if (buf.turnEndTimeout) clearTimeout(buf.turnEndTimeout);
+  buf.turnEndTimeout = setTimeout(() => {
+    const now = Date.now();
+    if (now - buf.lastTurnEndAt < 800) return;
+    // 충분한 콘텐츠(50자 이상)가 쌓여야 턴 완료로 인정
+    // 배너/노이즈만 있는 경우 턴 완료를 발생시키지 않음
+    if ((buf.contentLength || 0) < 50) {
+      buf.hasContentOutput = false;
+      return;
     }
-  }
-  if (buf.turnDetectState === 'saw_tokens') {
-    // 토큰 관련 줄 이후 debounce 타이머 시작/리셋
-    if (buf.turnEndTimeout) clearTimeout(buf.turnEndTimeout);
-    buf.turnEndTimeout = setTimeout(() => {
-      const now = Date.now();
-      if (now - buf.lastTurnEndAt < 3000) return; // 3초 debounce
-      buf.lastTurnEndAt = now;
-      buf.turnDetectState = 'idle';
-      buf.turnDetectBuffer = '';
-      if (mainWindow && !mainWindow.isDestroyed()) {
-        mainWindow.webContents.send('cli:turnDone', { id });
-      }
-    }, 2000);
-  }
+    buf.lastTurnEndAt = now;
+    buf.hasContentOutput = false;
+    buf.contentLength = 0;
+    buf.turnDetectBuffer = '';
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('cli:turnDone', { id });
+    }
+  }, 800);
 }
 
 // 미완성 ANSI 시퀀스 감지: 문자열 끝에 잘린 ESC 시퀀스가 있으면 분리
@@ -1017,10 +1024,12 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
       processBuffers.set(id, {
         vterm,
         turnDetectBuffer: '',
-        turnDetectState: 'idle',
+        hasContentOutput: false,
+        contentLength: 0,
         lastTurnEndAt: 0,
         turnEndTimeout: null,
         diffTimer: null,       // 디바운스 타이머
+        lastContentChunk: '',  // 연속 중복 콘텐츠 방지
         lastStatusLine: '',    // status 중복 방지
         lastProgressLine: '',  // progress 중복 방지
       });
@@ -1066,13 +1075,20 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
           }
 
           if (contentLines.length > 0) {
-            emitCliStream(id, { type: 'stdout', chunk: contentLines.join('\n') + '\n' });
+            const contentChunk = contentLines.join('\n') + '\n';
+            // 연속 중복 콘텐츠 필터링 (CLI 화면 재그리기로 같은 텍스트 반복 방지)
+            if (contentChunk !== buf.lastContentChunk) {
+              buf.lastContentChunk = contentChunk;
+              emitCliStream(id, { type: 'stdout', chunk: contentChunk });
+              buf.contentLength = (buf.contentLength || 0) + contentChunk.length;
+              buf.hasContentOutput = true;
+            }
+            // 턴 완료 감지: 실제 콘텐츠가 있을 때만 타이머 시작/리셋
+            // (status/progress만 있는 diff에서 타이머 리셋하면 turnDone이 영원히 안 옴)
+            buf.turnDetectBuffer = (buf.turnDetectBuffer + changed).slice(-500);
+            detectTurnCompletion(buf, mainWindow, id);
           }
-
-          // 턴 완료 감지 (필터링 전 전체 변경 텍스트 사용)
-          buf.turnDetectBuffer = (buf.turnDetectBuffer + changed).slice(-500);
-          detectTurnCompletion(buf, mainWindow, id);
-        }, 50);
+        }, 16);
       });
 
       proc.onExit(({ exitCode }) => {
@@ -1123,6 +1139,26 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
 ipcMain.handle('cli:write', (event, { id, data }) => {
   const handle = runningProcesses.get(id);
   if (handle) {
+    // 사용자 입력 시 이전 턴의 turn detection 타이머 취소
+    // (새 입력 = 새 턴이므로 이전 idle 감지는 무효)
+    const buf = processBuffers.get(id);
+    if (buf) {
+      if (buf.turnEndTimeout) {
+        clearTimeout(buf.turnEndTimeout);
+        buf.turnEndTimeout = null;
+      }
+      buf.hasContentOutput = false;
+      buf.contentLength = 0;
+      buf.turnDetectBuffer = '';
+      buf.lastContentChunk = '';
+      // 디바운스 버퍼 즉시 플러시하여 stale 데이터가 새 턴에 섞이지 않게
+      if (buf.diffTimer) {
+        clearTimeout(buf.diffTimer);
+        buf.diffTimer = null;
+      }
+      // 현재 스크린 스냅샷을 리셋하여 다음 diff가 깨끗하게 시작
+      buf.vterm.prevSnap = buf.vterm.snapshot();
+    }
     handle.write(data);
     return { success: true };
   }
