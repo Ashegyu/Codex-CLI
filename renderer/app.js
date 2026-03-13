@@ -1949,14 +1949,16 @@
     if (isResume) {
       args.push('resume', sessionId);
     }
+    args.push('--full-auto');
     args.push('--skip-git-repo-check');
 
     // sandbox 모드에 따라 실행 방식 결정
-    // -a (approval), -s (sandbox)는 글로벌 옵션이므로 exec 앞에 배치해야 한다.
+    // --full-auto는 -a on-request -s workspace-write의 약칭이므로,
+    // 글로벌 -a/-s 옵션으로 사용자 설정을 오버라이드한다.
     if (sandboxMode === 'danger-full-access') {
       args.push('--dangerously-bypass-approvals-and-sandbox');
     } else {
-      // 승인 정책: 글로벌 -a와 -s로 전달
+      // 승인 정책: 글로벌 -a로 오버라이드
       const approvalFlag = resolveCodexApprovalFlag(approvalPolicy);
       if (approvalFlag) {
         globalArgs.push('-a', approvalFlag);
@@ -1980,7 +1982,7 @@
     }
     const built = [...globalArgs, ...args];
     try {
-      console.log(`[codex-args] mode=${effectiveMode} approvalPolicy=${approvalPolicy} approvalFlag=${resolveCodexApprovalFlag(approvalPolicy) || 'auto'} isResume=${isResume} args=${JSON.stringify(built)}`);
+      console.log(`[codex-args] mode=exec approvalPolicy=${approvalPolicy} approvalFlag=${resolveCodexApprovalFlag(approvalPolicy) || 'auto'} isResume=${isResume} args=${JSON.stringify(built)}`);
     } catch { /* ignore */ }
     return built;
   }
@@ -3562,9 +3564,11 @@
         const delBtn = target.closest('.history-delete-btn');
         if (delBtn) { e.preventDefault(); e.stopPropagation(); deleteConversation(delBtn.dataset.deleteId); return; }
 
-        // 작업폴더 그룹 접기/펼치기
+        // 작업폴더 그룹 접기/펼치기 (사이드바 닫힘 방지)
         const cwdToggle = target.closest('.folder-header[data-cwd-toggle]');
         if (cwdToggle) {
+          e.preventDefault();
+          e.stopPropagation();
           const key = cwdToggle.dataset.cwdToggle;
           if (collapsedCwdGroups.has(key)) collapsedCwdGroups.delete(key);
           else collapsedCwdGroups.add(key);
