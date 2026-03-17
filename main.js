@@ -622,6 +622,27 @@ function readFileGeneric(targetPath) {
   }
 }
 
+function readFilesGeneric(filePaths, limit = 10) {
+  if (!Array.isArray(filePaths) || filePaths.length === 0) {
+    return { success: false, error: '파일 경로가 없습니다.', files: [] };
+  }
+
+  const results = [];
+  for (const fp of filePaths.slice(0, limit)) {
+    const resolved = resolveFilePath(fp) || fp;
+    results.push(readFileGeneric(resolved));
+  }
+
+  const successCount = results.filter(item => item?.success).length;
+  return {
+    success: successCount > 0,
+    error: successCount > 0 ? '' : (results[0]?.error || '파일을 불러오지 못했습니다.'),
+    files: results,
+    limit,
+    selectionLimited: filePaths.length > limit,
+  };
+}
+
 function formatFileSizeLabel(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
@@ -1244,7 +1265,7 @@ ipcMain.handle('file:pickAndRead', async () => {
   const result = await dialog.showOpenDialog(mainWindow, {
     title: '불러올 파일 선택',
     defaultPath: workingDirectory,
-    properties: ['openFile'],
+    properties: ['openFile', 'multiSelections'],
     filters: [
       { name: '모든 지원 파일', extensions: ['txt', 'md', 'js', 'ts', 'jsx', 'tsx', 'py', 'java', 'c', 'cpp', 'h', 'hpp', 'cs', 'go', 'rs', 'rb', 'php', 'html', 'css', 'json', 'xml', 'yaml', 'yml', 'toml', 'ini', 'cfg', 'sh', 'bat', 'ps1', 'sql', 'r', 'swift', 'kt', 'scala', 'lua', 'pl', 'pm', 'vue', 'svelte', 'png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif', 'pdf', 'doc', 'docx', 'xls', 'xlsx', 'ppt', 'pptx', 'csv', 'log', 'env'] },
       { name: '이미지', extensions: ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp', 'svg', 'ico', 'tiff', 'tif'] },
@@ -1259,7 +1280,7 @@ ipcMain.handle('file:pickAndRead', async () => {
     return { success: false, canceled: true, error: '파일 선택이 취소되었습니다.' };
   }
 
-  return readFileGeneric(result.filePaths[0]);
+  return readFilesGeneric(result.filePaths);
 });
 
 ipcMain.handle('file:read', (event, { filePath }) => {
@@ -1272,15 +1293,7 @@ ipcMain.handle('file:read', (event, { filePath }) => {
 
 // 드래그 앤 드롭으로 받은 파일 경로 배열을 일괄 읽기
 ipcMain.handle('file:readMultiple', (event, { filePaths }) => {
-  if (!Array.isArray(filePaths) || filePaths.length === 0) {
-    return { success: false, error: '파일 경로가 없습니다.', files: [] };
-  }
-  const results = [];
-  for (const fp of filePaths.slice(0, 10)) { // 최대 10개
-    const resolved = resolveFilePath(fp) || fp;
-    results.push(readFileGeneric(resolved));
-  }
-  return { success: true, files: results };
+  return readFilesGeneric(filePaths);
 });
 
 ipcMain.handle('file:open', async (event, { filePath }) => {

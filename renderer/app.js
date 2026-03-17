@@ -2163,6 +2163,12 @@
     return `[불러온 파일]\n경로: ${fileData.path}${truncatedNote}\`\`\`${language}\n${fileData.content}\n\`\`\``;
   }
 
+  function buildImportedFilesPrompt(fileList) {
+    return (Array.isArray(fileList) ? fileList : [])
+      .map(file => buildImportedFilePrompt(file))
+      .join('\n\n');
+  }
+
   function formatAttachmentSize(bytes) {
     if (!bytes || !Number.isFinite(bytes)) return '';
     if (bytes < 1024) return `${bytes}B`;
@@ -2188,6 +2194,67 @@
       truncated: !!fileData.truncated,
     });
     renderAttachmentPreview();
+  }
+
+  function getFileReadResults(result) {
+    if (Array.isArray(result?.files)) return result.files.filter(Boolean);
+    if (result && (result.success || result.error || result.path)) return [result];
+    return [];
+  }
+
+  function splitFileReadResults(result) {
+    const files = getFileReadResults(result);
+    const successes = files.filter(file => file?.success);
+    const failures = files.filter(file => file && !file.success);
+    const attachmentFiles = [];
+    const textFiles = [];
+
+    for (const file of successes) {
+      const fileType = file.fileType || 'text';
+      if (fileType === 'image' || fileType === 'pdf' || fileType === 'document' || fileType === 'archive') {
+        attachmentFiles.push(file);
+      } else {
+        textFiles.push(file);
+      }
+    }
+
+    return { files, successes, failures, textFiles, attachmentFiles };
+  }
+
+  function buildFileImportFeedback(result, textFiles, attachmentFiles, failures, options = {}) {
+    const notices = [];
+    const attachmentMode = !!options.attachmentMode;
+
+    if (attachmentMode) {
+      if (attachmentFiles.length === 1) {
+        notices.push(`파일을 첨부했습니다: ${attachmentFiles[0].fileName || attachmentFiles[0].path}`);
+      } else if (attachmentFiles.length > 1) {
+        notices.push(`파일 ${attachmentFiles.length}개를 첨부했습니다.`);
+      }
+    } else {
+      if (textFiles.length === 1) {
+        const suffix = textFiles[0].truncated ? ' (크기 제한으로 일부만 로드)' : '';
+        notices.push(`파일을 불러왔습니다: ${textFiles[0].path}${suffix}`);
+      } else if (textFiles.length > 1) {
+        notices.push(`텍스트 파일 ${textFiles.length}개를 입력창에 불러왔습니다.`);
+      }
+
+      if (attachmentFiles.length === 1) {
+        notices.push(`파일을 첨부했습니다: ${attachmentFiles[0].fileName || attachmentFiles[0].path} (${attachmentFiles[0].fileType || 'file'})`);
+      } else if (attachmentFiles.length > 1) {
+        notices.push(`파일 ${attachmentFiles.length}개를 첨부했습니다.`);
+      }
+    }
+
+    if (failures.length > 0) {
+      notices.push(`실패 ${failures.length}개`);
+    }
+
+    if (result?.selectionLimited) {
+      notices.push(`최대 ${result.limit || 10}개만 처리했습니다.`);
+    }
+
+    return notices.join(' ').trim();
   }
 
   function removePendingAttachment(index) {
@@ -2843,30 +2910,25 @@
       ? await window.electronAPI.file.read(pathArg)
       : await window.electronAPI.file.pickAndRead();
 
-    if (!result || !result.success) {
+    const { successes, failures, textFiles, attachmentFiles } = splitFileReadResults(result);
+
+    if (successes.length === 0) {
       if (!result?.canceled) {
-        showSlashFeedback(result?.error || '파일을 불러오지 못했습니다.', true);
+        showSlashFeedback(failures[0]?.error || result?.error || '파일을 불러오지 못했습니다.', true);
       }
       return;
     }
 
-    const fileType = result.fileType || 'text';
+    attachmentFiles.forEach(addPendingAttachment);
 
-    // 이미지/PDF/바이너리 파일은 첨부 큐에 추가
-    if (fileType === 'image' || fileType === 'pdf' || fileType === 'document' || fileType === 'archive') {
-      addPendingAttachment(result);
-      showSlashFeedback(`파일을 첨부했습니다: ${result.fileName || result.path} (${fileType})`, false);
-      $input.focus();
-      return;
+    if (textFiles.length > 0) {
+      $input.value = buildImportedFilesPrompt(textFiles);
+      autoResizeInput();
+      hideSlashMenu();
     }
 
-    // 텍스트 파일: 기존 동작 (입력창에 프롬프트 생성)
-    $input.value = buildImportedFilePrompt(result);
-    autoResizeInput();
-    hideSlashMenu();
     $input.focus();
-    const suffix = result.truncated ? ' (크기 제한으로 일부만 로드)' : '';
-    showSlashFeedback(`파일을 불러왔습니다: ${result.path}${suffix}`, false);
+    showSlashFeedback(buildFileImportFeedback(result, textFiles, attachmentFiles, failures), false);
   }
 
   async function handleAtFileCommand(line) {
@@ -9180,9 +9242,17 @@
     $btnAttach.addEventListener('click', async () => {
       try {
         const result = await window.electronAPI.file.pickAndRead();
-        if (result && result.success) {
-          addPendingAttachment(result);
+        const { successes, failures } = splitFileReadResults(result);
+        if (successes.length === 0) {
+          if (!result?.canceled) {
+            showSlashFeedback(failures[0]?.error || result?.error || '파일을 첨부하지 못했습니다.', true);
+          }
+          return;
         }
+
+        successes.forEach(addPendingAttachment);
+        const message = buildFileImportFeedback(result, [], successes, failures, { attachmentMode: true });
+        if (message) showSlashFeedback(message, false);
       } catch (err) {
         console.error('[attach] pick error:', err);
       }
