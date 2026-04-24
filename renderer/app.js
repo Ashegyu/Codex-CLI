@@ -9387,8 +9387,22 @@ ${userPrompt}
       finish();
     });
 
+    const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
+      if (id !== streamId) return;
+      exitCode = 1;
+      aiMsg.role = 'error';
+      aiMsg.content = fullOutput.trim()
+        ? `${fullOutput.trim()}\n\n오류가 발생했습니다: ${error}`
+        : `오류가 발생했습니다: ${error}`;
+      if (convId === activeConvId) {
+        bodyEl.textContent = aiMsg.content;
+      }
+      finish();
+    });
+
     streamState.unsubStream = unsubStream;
     streamState.unsubDone = unsubDone;
+    streamState.unsubError = unsubError;
 
     function finish() {
       if (finished) return;
@@ -9397,6 +9411,7 @@ ${userPrompt}
       convStreams.delete(convId);
       unsubStream();
       unsubDone();
+      unsubError();
       void refreshCodexRateLimits('after-subcommand');
 
       if (!String(aiMsg.content || '').trim()) {
@@ -9406,6 +9421,9 @@ ${userPrompt}
         } else {
           aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
         }
+      }
+      if (exitCode != null && exitCode !== 0) {
+        aiMsg.role = 'error';
       }
 
       if (convId === activeConvId) {
@@ -9681,8 +9699,23 @@ ${userPrompt}
       finishStream();
     });
 
+    const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
+      if (id !== streamId) return;
+      streamErrorMessage = `오류가 발생했습니다: ${error}`;
+      aiMsg.role = 'error';
+      aiMsg.content = fullOutput.trim()
+        ? `${fullOutput.trim()}\n\n${streamErrorMessage}`
+        : streamErrorMessage;
+      if (convId === activeConvId) {
+        const errBody = resolveBodyEl();
+        errBody.textContent = aiMsg.content;
+      }
+      finishStream();
+    });
+
     streamState.unsubStream = unsubStream;
     streamState.unsubDone = unsubDone;
+    streamState.unsubError = unsubError;
 
     function finishStream() {
       if (finished) return;
@@ -9694,14 +9727,23 @@ ${userPrompt}
       convStreams.delete(convId);
       unsubStream();
       unsubDone();
+      unsubError();
 
-      if (!String(aiMsg.content || '').trim()) {
+      if (streamErrorMessage) {
+        aiMsg.role = 'error';
+        if (!String(aiMsg.content || '').trim()) {
+          aiMsg.content = streamErrorMessage;
+        }
+      } else if (!String(aiMsg.content || '').trim()) {
         if (exitCode != null && exitCode !== 0) {
           aiMsg.role = 'error';
           aiMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
         } else {
           aiMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
         }
+      } else if (exitCode != null && exitCode !== 0) {
+        aiMsg.role = 'error';
+        aiMsg.content = `${aiMsg.content}\n\n실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
       }
 
       // 세션 ID 추출 후 대화에 저장
