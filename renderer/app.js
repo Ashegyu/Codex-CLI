@@ -34,12 +34,26 @@
             : (actualCodeDiffs.length > 0
               ? (Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now())
               : 0);
+          const attachments = Array.isArray(msg.attachments)
+            ? msg.attachments
+                .filter(att => att && typeof att === 'object')
+                .map(att => ({
+                  fileType: typeof att.fileType === 'string' ? att.fileType : 'file',
+                  fileName: typeof att.fileName === 'string' ? att.fileName : '',
+                  path: typeof att.path === 'string' ? att.path : '',
+                  mimeType: typeof att.mimeType === 'string' ? att.mimeType : '',
+                  size: Number.isFinite(Number(att.size)) ? Number(att.size) : 0,
+                  truncated: !!att.truncated,
+                }))
+                .filter(att => att.fileName || att.path)
+            : [];
           return {
             id: typeof msg.id === 'string' && msg.id ? msg.id : `msg_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
             role: msg.role === 'user' || msg.role === 'error' ? msg.role : 'ai',
             content: typeof msg.content === 'string' ? msg.content : '',
             profileId: 'codex',
             timestamp: Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now(),
+            attachments: attachments.length ? attachments : undefined,
             actualCodeDiffs,
             actualCodeDiffsFetchedAt,
           };
@@ -110,6 +124,58 @@
   const hljsApi = globalThis.hljs && typeof globalThis.hljs.highlight === 'function'
     ? globalThis.hljs
     : null;
+
+  const SAFE_LINK_PROTOCOLS = new Set(['http:', 'https:', 'mailto:']);
+  const SAFE_IMAGE_PROTOCOLS = new Set(['http:', 'https:', 'data:']);
+
+  function isSafeUrlProtocol(rawHref, allowedProtocols) {
+    const href = String(rawHref || '').trim();
+    if (!href) return false;
+    if (href.startsWith('#')) return true;
+    try {
+      const parsed = new URL(href, window.location.href);
+      if (parsed.protocol === 'data:') {
+        return allowedProtocols.has('data:') && /^data:image\/(?:png|jpe?g|gif|webp|bmp|svg\+xml);base64,/i.test(href);
+      }
+      return allowedProtocols.has(parsed.protocol);
+    } catch {
+      return false;
+    }
+  }
+
+  function sanitizeRenderedHtml(html) {
+    const template = document.createElement('template');
+    template.innerHTML = String(html || '');
+    const blockedTags = new Set(['script', 'iframe', 'object', 'embed', 'link', 'meta', 'base', 'form', 'input', 'textarea', 'select', 'option']);
+    const elements = Array.from(template.content.querySelectorAll('*'));
+    for (const el of elements) {
+      const tag = String(el.tagName || '').toLowerCase();
+      if (blockedTags.has(tag)) {
+        el.remove();
+        continue;
+      }
+      for (const attr of Array.from(el.attributes)) {
+        const name = attr.name.toLowerCase();
+        const value = attr.value || '';
+        if (name.startsWith('on') || name === 'srcdoc') {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === 'href' && !isSafeUrlProtocol(value, SAFE_LINK_PROTOCOLS) && value !== '#') {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === 'src' && !isSafeUrlProtocol(value, SAFE_IMAGE_PROTOCOLS)) {
+          el.removeAttribute(attr.name);
+          continue;
+        }
+        if (name === 'style' && /(?:expression\s*\(|url\s*\(\s*['"]?\s*javascript:)/i.test(value)) {
+          el.removeAttribute(attr.name);
+        }
+      }
+    }
+    return template.innerHTML;
+  }
 
   const LANG_ALIAS = {
     js: 'javascript',
@@ -649,6 +715,13 @@
     </div>`;
   };
 
+  renderer.html = function (tokenOrHtml) {
+    const raw = typeof tokenOrHtml === 'object' && tokenOrHtml !== null
+      ? String(tokenOrHtml.raw || tokenOrHtml.text || '')
+      : String(tokenOrHtml || '');
+    return escapeHtml(raw);
+  };
+
   // 링크 렌더러: 파일 경로를 안전하게 처리
   renderer.link = function (tokenOrHref, maybeTitle, maybeText) {
     let href, title, text;
@@ -672,10 +745,32 @@
       const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
       return `<a href="#" class="file-path-link markdown-local-link" data-local-path="${encodedPath}"${lineAttr}${safeTitle}>${escapeHtml(text || href)}</a>`;
     }
+    if (!isSafeUrlProtocol(href, SAFE_LINK_PROTOCOLS)) {
+      return `<span>${escapeHtml(text || href)}</span>`;
+    }
     const safeHref = escapeHtml(href);
     const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
     const safeText = escapeHtml(text || href);
     return `<a href="${safeHref}"${safeTitle} target="_blank" rel="noopener">${safeText}</a>`;
+  };
+
+  renderer.image = function (tokenOrHref, maybeTitle, maybeText) {
+    let href, title, text;
+    if (typeof tokenOrHref === 'object' && tokenOrHref !== null) {
+      href = tokenOrHref.href || '';
+      title = tokenOrHref.title || '';
+      text = tokenOrHref.text || '';
+    } else {
+      href = String(tokenOrHref || '');
+      title = String(maybeTitle || '');
+      text = String(maybeText || '');
+    }
+    if (!isSafeUrlProtocol(href, SAFE_IMAGE_PROTOCOLS)) {
+      return escapeHtml(text || href);
+    }
+    const safeHref = escapeHtml(href);
+    const safeTitle = title ? ` title="${escapeHtml(title)}"` : '';
+    return `<img src="${safeHref}" alt="${escapeHtml(text || '')}"${safeTitle}>`;
   };
 
   marked.setOptions({
@@ -788,6 +883,7 @@
     // --- 설정 ---
     { command: '/model', description: '모델 변경', usage: '/model [모델명]' },
     { command: '/reasoning', description: 'Reasoning effort 변경', usage: '/reasoning [low|medium|high|extra high]' },
+    { command: '/models', description: 'Codex CLI 모델 목록 새로고침/표시', usage: '/models' },
     { command: '/sandbox', description: '샌드박스 모드 변경', usage: '/sandbox [read-only|workspace-write|danger-full-access]' },
     { command: '/cwd', description: '작업 폴더 변경', usage: '/cwd [경로]' },
     // --- 앱 기능 ---
@@ -806,15 +902,14 @@
     { command: '/agents', description: '사용 가능한 에이전트 목록', usage: '/agents' },
   ];
   // 기본 모델 목록 (드롭다운 빠른 선택용) + 커스텀 입력 지원
-  const MODEL_OPTIONS = [
-    { id: 'gpt-5.4', cliModel: 'gpt-5.4' },
-    { id: 'gpt-5.3-codex', cliModel: 'gpt-5.3-codex' },
-    { id: 'gpt-5.2-codex', cliModel: 'gpt-5.2-codex' },
-    { id: 'gpt-5.1-codex-max', cliModel: 'gpt-5.1-codex-max' },
-    { id: 'gpt-5.2', cliModel: 'gpt-5.2' },
-    { id: 'gpt-5.1-codex-mini', cliModel: 'gpt-5.1-codex-mini' },
+  const FALLBACK_MODEL_OPTIONS = [
+    { id: 'gpt-5.4', cliModel: 'gpt-5.4', label: 'gpt-5.4', source: 'fallback' },
+    { id: 'gpt-5.4-mini', cliModel: 'gpt-5.4-mini', label: 'GPT-5.4-Mini', source: 'fallback' },
+    { id: 'gpt-5.3-codex', cliModel: 'gpt-5.3-codex', label: 'gpt-5.3-codex', source: 'fallback' },
+    { id: 'gpt-5.2', cliModel: 'gpt-5.2', label: 'gpt-5.2', source: 'fallback' },
   ];
-  const MODEL_OPTION_IDS = MODEL_OPTIONS.map(item => item.id);
+  let modelOptions = FALLBACK_MODEL_OPTIONS.map(item => ({ ...item }));
+  let modelCatalogSource = 'fallback';
   const REASONING_OPTIONS = ['low', 'medium', 'high', 'extra high'];
   const DEFAULT_MODEL_ID = 'gpt-5.4';
   const DEFAULT_REASONING = 'extra high';
@@ -1671,8 +1766,84 @@
     return normalized.replace(/\b\w/g, ch => ch.toUpperCase());
   }
 
+  function getModelOptions() {
+    return Array.isArray(modelOptions) && modelOptions.length > 0
+      ? modelOptions
+      : FALLBACK_MODEL_OPTIONS;
+  }
+
+  function getModelOptionIds() {
+    return getModelOptions().map(item => item.id);
+  }
+
   function getModelOptionById(id) {
-    return MODEL_OPTIONS.find(option => option.id === id) || null;
+    return getModelOptions().find(option => option.id === id) || null;
+  }
+
+  function normalizeModelOption(rawModel) {
+    const id = String(rawModel?.id || rawModel?.slug || rawModel?.cliModel || '').trim();
+    if (!id) return null;
+    return {
+      id,
+      cliModel: String(rawModel?.cliModel || rawModel?.slug || id).trim(),
+      label: String(rawModel?.label || rawModel?.displayName || rawModel?.display_name || id).trim(),
+      description: String(rawModel?.description || '').trim(),
+      defaultReasoning: normalizeReasoning(rawModel?.defaultReasoning || rawModel?.default_reasoning_level || ''),
+      supportedReasoning: Array.isArray(rawModel?.supportedReasoning) ? rawModel.supportedReasoning.map(normalizeReasoning).filter(Boolean) : [],
+      source: String(rawModel?.source || '').trim(),
+    };
+  }
+
+  function setModelOptionsFromCatalog(models, source) {
+    const normalized = [];
+    const seen = new Set();
+    for (const item of Array.isArray(models) ? models : []) {
+      const model = normalizeModelOption(item);
+      if (!model) continue;
+      const key = model.id.toLowerCase();
+      if (seen.has(key)) continue;
+      seen.add(key);
+      normalized.push(model);
+    }
+    if (normalized.length === 0) return false;
+    modelOptions = normalized;
+    modelCatalogSource = source || normalized[0]?.source || 'codex';
+    codexRuntimeInfo.model = normalizeModelOptionId(codexRuntimeInfo.model);
+    saveCodexRuntimeInfo();
+    updateRuntimeHint();
+    if (runtimeMenuType === 'model') renderRuntimeMenu('model');
+    return true;
+  }
+
+  async function refreshCodexModelOptions() {
+    if (!window.electronAPI?.codex?.listModels) return false;
+    try {
+      const result = await window.electronAPI.codex.listModels();
+      if (!result?.success || !Array.isArray(result.models)) return false;
+      return setModelOptionsFromCatalog(result.models, result.source || 'codex');
+    } catch (err) {
+      console.error('[models] listModels failed:', err);
+      return false;
+    }
+  }
+
+  function formatModelOptionLabel(modelId) {
+    const option = getModelOptionById(modelId);
+    return option?.label || modelId;
+  }
+
+  async function showCodexModelList() {
+    const refreshed = await refreshCodexModelOptions();
+    const sourceLabel = modelCatalogSource === 'codex-debug'
+      ? 'Codex CLI 최신 catalog'
+      : (modelCatalogSource === 'codex-bundled' ? 'Codex CLI bundled catalog' : '내장 fallback');
+    const lines = getModelOptions().map((model) => {
+      const desc = model.description ? ` - ${model.description}` : '';
+      const reasoning = model.defaultReasoning ? ` (기본 reasoning: ${formatReasoningLabel(model.defaultReasoning)})` : '';
+      return `  ${model.id}${reasoning}${desc}`;
+    });
+    const suffix = refreshed ? '' : '\n새로고침 실패로 현재 캐시/fallback 목록을 표시합니다.';
+    showSlashFeedback(`Codex 모델 목록 (${getModelOptions().length}개, ${sourceLabel}):\n${lines.join('\n')}${suffix}`, false);
   }
 
   function normalizeModelOptionId(value) {
@@ -1680,11 +1851,11 @@
     if (!raw) return DEFAULT_MODEL_ID;
 
     // 목록에 있으면 그대로
-    if (MODEL_OPTION_IDS.includes(raw)) return raw;
+    if (getModelOptionIds().includes(raw)) return raw;
 
     // case-insensitive 매칭
     const lower = raw.toLowerCase();
-    const match = MODEL_OPTIONS.find(m => m.id.toLowerCase() === lower || m.cliModel === lower);
+    const match = getModelOptions().find(m => m.id.toLowerCase() === lower || String(m.cliModel || '').toLowerCase() === lower);
     if (match) return match.id;
 
     if (lower === 'auto') return DEFAULT_MODEL_ID;
@@ -1744,9 +1915,9 @@
     runtimeMenuType = type;
     let options, currentValue, labelFn;
     if (type === 'model') {
-      options = MODEL_OPTION_IDS;
+      options = getModelOptionIds();
       currentValue = codexRuntimeInfo.model;
-      labelFn = opt => opt;
+      labelFn = opt => formatModelOptionLabel(opt);
     } else if (type === 'reasoning') {
       options = REASONING_OPTIONS;
       currentValue = codexRuntimeInfo.reasoning;
@@ -1780,12 +1951,15 @@
       return;
     }
     // 모델 메뉴: 커스텀 입력 필드 추가
-    const isCustomModel = type === 'model' && !MODEL_OPTION_IDS.includes(currentValue);
-    let html = options.map(opt => `
-      <button type="button" class="runtime-option ${opt === currentValue ? 'active' : ''}" data-runtime-type="${type}" data-runtime-value="${opt}">
+    const isCustomModel = type === 'model' && !getModelOptionIds().includes(currentValue);
+    let html = options.map(opt => {
+      const model = type === 'model' ? getModelOptionById(opt) : null;
+      const titleAttr = model?.description ? ` title="${escapeHtml(model.description)}"` : '';
+      return `
+      <button type="button" class="runtime-option ${opt === currentValue ? 'active' : ''}" data-runtime-type="${type}" data-runtime-value="${opt}"${titleAttr}>
         ${escapeHtml(labelFn(opt))}
-      </button>
-    `).join('');
+      </button>`;
+    }).join('');
     if (type === 'model') {
       html += `<div class="runtime-custom-model" style="padding:4px 8px;border-top:1px solid var(--border);">
         <input type="text" class="runtime-custom-model-input" placeholder="커스텀 모델명 입력..." value="${isCustomModel ? escapeHtml(currentValue) : ''}" style="width:100%;padding:4px 6px;background:var(--bg-secondary);color:var(--text);border:1px solid var(--border);border-radius:4px;font-size:12px;" />
@@ -1891,7 +2065,11 @@
   function updateRuntimeHint() {
     if ($modelHint) {
       const modelId = normalizeModelOptionId(codexRuntimeInfo.model);
-      $modelHint.textContent = `모델: ${modelId}`;
+      const model = getModelOptionById(modelId);
+      $modelHint.textContent = `모델: ${formatModelOptionLabel(modelId)}`;
+      $modelHint.title = model?.description
+        ? `${model.id}\n${model.description}\n목록 출처: ${modelCatalogSource}`
+        : `목록 출처: ${modelCatalogSource}`;
     }
     if ($planModeHint) {
       $planModeHint.textContent = `이성모델: ${formatReasoningLabel(codexRuntimeInfo.reasoning)}`;
@@ -2054,6 +2232,11 @@
         globalArgs.push('-s', 'workspace-write');
       }
     }
+    const imagePaths = Array.isArray(options.imagePaths) ? options.imagePaths : [];
+    for (const imagePath of imagePaths) {
+      const value = String(imagePath || '').trim();
+      if (value) globalArgs.push('--image', value);
+    }
     args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
     const effort = normalizeReasoning(codexRuntimeInfo.reasoning);
@@ -2161,12 +2344,11 @@
     const fileName = fileData.fileName || fileData.path;
 
     if (fileType === 'image') {
-      // 이미지: base64 데이터를 프롬프트에 포함 (Codex CLI가 이미지 처리 가능)
-      return `[첨부 이미지]\n파일: ${fileName}\n형식: ${fileData.mimeType || 'image'}\n크기: ${formatAttachmentSize(fileData.size)}\n\n이미지가 첨부되었습니다. 위 이미지를 분석해주세요.`;
+      return `[첨부 이미지]\n파일: ${fileName}\n경로: ${fileData.path || '(unknown)'}\n형식: ${fileData.mimeType || 'image'}\n크기: ${formatAttachmentSize(fileData.size)}\n\n이미지는 Codex CLI --image 입력으로 함께 전달됩니다.`;
     }
 
     if (fileType === 'pdf') {
-      return `[첨부 PDF]\n파일: ${fileName}\n크기: ${formatAttachmentSize(fileData.size)}\n\nPDF 파일이 첨부되었습니다. 내용을 분석해주세요.`;
+      return `[첨부 PDF]\n파일: ${fileName}\n경로: ${fileData.path || '(unknown)'}\n크기: ${formatAttachmentSize(fileData.size)}\n\n필요하면 이 로컬 파일 경로를 열어 내용을 분석하세요.`;
     }
 
     if (fileType === 'document' || fileType === 'archive') {
@@ -2322,6 +2504,12 @@
       ...att,
       success: true,
     })).join('\n\n');
+  }
+
+  function getCodexImageAttachmentPaths(attachments) {
+    return (Array.isArray(attachments) ? attachments : [])
+      .filter(att => att?.fileType === 'image' && typeof att.path === 'string' && att.path.trim())
+      .map(att => att.path.trim());
   }
 
 
@@ -2998,13 +3186,18 @@
     if (command === '/model') {
       if (argText) {
         // 목록에 있으면 매칭, 없으면 커스텀 모델로 허용
-        const match = MODEL_OPTION_IDS.find(id => id.toLowerCase() === argText.toLowerCase());
+        const match = getModelOptionIds().find(id => id.toLowerCase() === argText.toLowerCase());
         const modelToSet = match || argText;
         setRuntimeOption('model', modelToSet);
         showSlashFeedback(`모델을 ${modelToSet}(으)로 변경했습니다.`, false);
       } else {
         renderRuntimeMenu('model');
       }
+      return true;
+    }
+
+    if (command === '/models') {
+      await showCodexModelList();
       return true;
     }
 
@@ -3465,7 +3658,8 @@
     if ($main) {
       $main.addEventListener('click', (e) => {
         if (sidebarCollapsed) return;
-        // Only close if clicking on the backdrop area (not sidebar itself)
+        // Pseudo-element backdrop clicks target #main itself; content clicks should pass through.
+        if (e.target !== $main) return;
         const sidebar = document.getElementById('sidebar');
         if (sidebar && sidebar.contains(e.target)) return;
         setSidebarCollapsed(true);
@@ -3862,6 +4056,7 @@
   runInitStep('profiles', () => renderProfiles());
   runInitStep('projects', () => renderProjects());
   runInitStep('active-profile', () => setActiveProfile(activeProfileId));
+  runInitStep('model-catalog', () => refreshCodexModelOptions());
   runInitStep('statusbar', () => updateCodexStatusbar());
   runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
 
@@ -4552,6 +4747,18 @@
     }
 
     const subProgressTimer = setInterval(renderSubagentProgress, 1000);
+    let subagentFinished = false;
+
+    function cleanupSubagentRun() {
+      if (subagentFinished) return false;
+      subagentFinished = true;
+      try { unsubStream(); } catch { /* ignore */ }
+      try { unsubDone(); } catch { /* ignore */ }
+      try { unsubError(); } catch { /* ignore */ }
+      clearInterval(subProgressTimer);
+      aiMsg._subagentStreaming = false;
+      return true;
+    }
 
     // 스트림 핸들러
     const unsubStream = window.electronAPI.cli.onStream(({ id, chunk, type }) => {
@@ -4572,11 +4779,7 @@
 
     const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
       if (id !== streamId) return;
-      unsubStream();
-      unsubDone();
-      unsubError();
-      clearInterval(subProgressTimer);
-      aiMsg._subagentStreaming = false;
+      if (!cleanupSubagentRun()) return;
 
       // Codex 출력을 파싱하여 response 섹션만 저장
       const sections = parseCodexOutput(fullOutput);
@@ -4623,11 +4826,7 @@
 
     const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
       if (id !== streamId) return;
-      unsubStream();
-      unsubDone();
-      unsubError();
-      clearInterval(subProgressTimer);
-      aiMsg._subagentStreaming = false;
+      if (!cleanupSubagentRun()) return;
       aiMsg.content = fullOutput || `오류: ${error}`;
       aiMsg.role = 'error';
       subConv.subagentMeta.status = 'error';
@@ -4653,6 +4852,7 @@
       });
 
       if (!runResult?.success) {
+        cleanupSubagentRun();
         aiMsg.content = `서브에이전트 실행 실패: ${runResult?.error || 'unknown error'}`;
         aiMsg.role = 'error';
         subConv.subagentMeta.status = 'error';
@@ -4660,6 +4860,7 @@
         renderHistory();
       }
     } catch (err) {
+      cleanupSubagentRun();
       aiMsg.content = `서브에이전트 실행 오류: ${err?.message || String(err)}`;
       aiMsg.role = 'error';
       subConv.subagentMeta.status = 'error';
@@ -5034,7 +5235,7 @@ ${userPrompt}
       const markdownSource = skipPreprocess
         ? normalizedLinks
         : preprocessMarkdown(normalizedLinks);
-      return marked.parse(markdownSource);
+      return sanitizeRenderedHtml(marked.parse(markdownSource));
     } catch {
       return escapeHtml(text).replace(/\r?\n/g, '<br>');
     }
@@ -9305,7 +9506,9 @@ ${userPrompt}
     const sentAttachments = pendingAttachments.slice();
     clearPendingAttachments();
 
-    const originalBuild = buildCodexArgs(sessionIdForExtraRun);
+    const originalBuild = buildCodexArgs(sessionIdForExtraRun, {
+      imagePaths: getCodexImageAttachmentPaths(sentAttachments),
+    });
     const mergedArgs = mergeCodexExecArgsWithGlobalFlags(originalBuild, extraArgs);
 
     if (conv.messages.length === 0) {
@@ -9368,6 +9571,7 @@ ${userPrompt}
     let responseStarted = false;
     let finished = false;
     let exitCode = null;
+    let streamErrorMessage = '';
     let latestSections = null;
     let lastSectionsParsedAt = 0;
     const previewState = createStreamingPreviewState(
@@ -10036,12 +10240,13 @@ ${userPrompt}
 
     const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
       if (id !== streamId) return;
-      aiMsg.content = `오류가 발생했습니다: ${error}`;
-      aiMsg.role = 'error';
+      streamErrorMessage = `오류가 발생했습니다: ${error}`;
+      streamState.currentAiMsg.role = 'error';
+      streamState.currentAiMsg.content = streamErrorMessage;
       const liveEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`) || aiEl;
       liveEl.className = 'message error';
       const errBody = liveEl.querySelector('.msg-body');
-      if (errBody) errBody.textContent = aiMsg.content;
+      if (errBody) errBody.textContent = streamErrorMessage;
       finishStream();
     });
 
@@ -10052,8 +10257,8 @@ ${userPrompt}
     function finishStream() {
       if (finished) return;
 
-      // 진행 중인 콘텐츠가 있으면 마무리
-      if (fullOutput && !streamState.betweenTurns) {
+      // 진행 중인 콘텐츠가 있으면 마무리. 에러 이벤트는 partial output을 성공 답변으로 seal하지 않는다.
+      if (fullOutput && !streamState.betweenTurns && !streamErrorMessage) {
         _sealCurrentTurn();
       }
 
@@ -10070,13 +10275,18 @@ ${userPrompt}
       unsubError();
 
       const currentMsg = streamState.currentAiMsg;
-      if (!String(currentMsg.content || '').trim()) {
-        if (exitCode != null && exitCode !== 0) {
-          currentMsg.role = 'error';
-          currentMsg.content = `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
-        } else {
-          currentMsg.content = '응답이 비어 있습니다. 다시 시도해 주세요.';
-        }
+      if (streamErrorMessage) {
+        const partial = String(fullOutput || '').trim();
+        currentMsg.role = 'error';
+        currentMsg.content = partial ? `${partial}\n\n${streamErrorMessage}` : streamErrorMessage;
+      } else if (!String(currentMsg.content || '').trim()) {
+        currentMsg.content = exitCode != null && exitCode !== 0
+          ? `실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`
+          : '응답이 비어 있습니다. 다시 시도해 주세요.';
+        if (exitCode != null && exitCode !== 0) currentMsg.role = 'error';
+      } else if (exitCode != null && exitCode !== 0) {
+        currentMsg.role = 'error';
+        currentMsg.content = `${currentMsg.content}\n\n실행이 실패했습니다 (code ${exitCode}). 네트워크/로그인 상태를 확인해 주세요.`;
       }
 
       // 세션 ID 추출 후 대화에 저장
@@ -10136,7 +10346,9 @@ ${userPrompt}
         id: streamId,
         profile: {
           command: profile.command,
-          args: buildCodexArgs(sessionIdForRun),
+          args: buildCodexArgs(sessionIdForRun, {
+            imagePaths: getCodexImageAttachmentPaths(sentAttachments),
+          }),
           mode: resolveCodexProcessMode(),
           env: {},
         },

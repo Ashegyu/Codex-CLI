@@ -13,6 +13,45 @@ let resolvedCliPaths = {}; // command name → resolved absolute path 캐시
 const MAX_FILE_IMPORT_BYTES = 180 * 1024;
 const MAX_IMAGE_IMPORT_BYTES = 20 * 1024 * 1024; // 이미지는 20MB까지
 const MAX_PDF_IMPORT_BYTES = 10 * 1024 * 1024; // PDF는 10MB까지
+const CODEX_MODEL_CATALOG_TIMEOUT_MS = 8000;
+const FALLBACK_CODEX_MODELS = [
+  {
+    id: 'gpt-5.4',
+    cliModel: 'gpt-5.4',
+    label: 'gpt-5.4',
+    description: 'Latest frontier agentic coding model.',
+    defaultReasoning: 'medium',
+    supportedReasoning: ['low', 'medium', 'high', 'extra high'],
+    source: 'fallback',
+  },
+  {
+    id: 'gpt-5.4-mini',
+    cliModel: 'gpt-5.4-mini',
+    label: 'GPT-5.4-Mini',
+    description: 'Smaller frontier agentic coding model.',
+    defaultReasoning: 'medium',
+    supportedReasoning: ['low', 'medium', 'high', 'extra high'],
+    source: 'fallback',
+  },
+  {
+    id: 'gpt-5.3-codex',
+    cliModel: 'gpt-5.3-codex',
+    label: 'gpt-5.3-codex',
+    description: 'Frontier Codex-optimized agentic coding model.',
+    defaultReasoning: 'medium',
+    supportedReasoning: ['low', 'medium', 'high', 'extra high'],
+    source: 'fallback',
+  },
+  {
+    id: 'gpt-5.2',
+    cliModel: 'gpt-5.2',
+    label: 'gpt-5.2',
+    description: 'Optimized for professional work and long-running agents.',
+    defaultReasoning: 'medium',
+    supportedReasoning: ['low', 'medium', 'high', 'extra high'],
+    source: 'fallback',
+  },
+];
 
 // 파일 확장자별 분류
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif']);
@@ -658,11 +697,15 @@ function resolveInitialCwd() {
   for (let i = 0; i < args.length; i++) {
     if (args[i] === '--cwd' && args[i + 1]) {
       const dir = args[i + 1];
-      if (fs.existsSync(dir)) return dir;
+      try {
+        if (fs.statSync(dir).isDirectory()) return dir;
+      } catch { /* ignore */ }
     }
     if (args[i].startsWith('--cwd=')) {
       const dir = args[i].slice(6);
-      if (fs.existsSync(dir)) return dir;
+      try {
+        if (fs.statSync(dir).isDirectory()) return dir;
+      } catch { /* ignore */ }
     }
   }
 
@@ -946,6 +989,40 @@ function shouldUseCodexStdinPrompt(commandName, args, useSpawnMode, promptText) 
     .some((arg) => String(arg || '').trim().toLowerCase() === 'exec');
 }
 
+function isAllowedCliCommand(commandName) {
+  const rawCommand = String(commandName || '').trim();
+  if (!rawCommand) return false;
+  const normalized = rawCommand.toLowerCase();
+  return normalized === 'codex'
+    || /(?:^|[\\/])codex(?:\.(?:cmd|ps1|exe))?$/i.test(rawCommand);
+}
+
+function normalizeCliArgs(args) {
+  if (!Array.isArray(args)) return [];
+  return args
+    .slice(0, 120)
+    .map(arg => String(arg ?? ''))
+    .filter(arg => arg.length <= 4096);
+}
+
+function resolveExistingDirectory(inputDir, fallbackDir = workingDirectory) {
+  const raw = String(inputDir || '').trim();
+  const candidate = raw || fallbackDir || os.homedir();
+  try {
+    const stat = fs.statSync(candidate);
+    if (stat.isDirectory()) return candidate;
+  } catch {
+    // fall through to fallback
+  }
+  try {
+    const stat = fs.statSync(fallbackDir);
+    if (stat.isDirectory()) return fallbackDir;
+  } catch {
+    // fall through to homedir
+  }
+  return os.homedir();
+}
+
 function formatCliArgsForLog(args, maxLen = 160) {
   return (Array.isArray(args) ? args : []).map((arg) => {
     const value = String(arg ?? '');
@@ -955,12 +1032,142 @@ function formatCliArgsForLog(args, maxLen = 160) {
   });
 }
 
+function normalizeCodexReasoningEffort(value) {
+  const normalized = String(value || '').trim().toLowerCase().replace(/[_-]+/g, ' ');
+  if (normalized === 'xhigh') return 'extra high';
+  if (normalized === 'extra high' || normalized === 'low' || normalized === 'medium' || normalized === 'high') {
+    return normalized;
+  }
+  return '';
+}
+
+function normalizeCodexModelCatalog(rawCatalog, source) {
+  const models = Array.isArray(rawCatalog?.models) ? rawCatalog.models : [];
+  const normalized = [];
+  const seen = new Set();
+
+  for (const model of models) {
+    const slug = String(model?.slug || model?.id || '').trim();
+    if (!slug) continue;
+    if (model?.visibility && String(model.visibility).toLowerCase() !== 'list') continue;
+    const key = slug.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+
+    const supportedReasoning = Array.isArray(model?.supported_reasoning_levels)
+      ? model.supported_reasoning_levels
+          .map(item => normalizeCodexReasoningEffort(item?.effort || item))
+          .filter(Boolean)
+      : [];
+
+    normalized.push({
+      id: slug,
+      cliModel: slug,
+      label: String(model?.display_name || slug).trim(),
+      description: String(model?.description || '').trim(),
+      defaultReasoning: normalizeCodexReasoningEffort(model?.default_reasoning_level),
+      supportedReasoning,
+      source,
+      priority: Number.isFinite(Number(model?.priority)) ? Number(model.priority) : 999,
+    });
+  }
+
+  return normalized;
+}
+
+function runCodexModelCatalogCommand(args, timeoutMs = CODEX_MODEL_CATALOG_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    let child = null;
+    let timer = null;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    try {
+      const codexPath = resolveCliPath('codex');
+      const directInvocation = resolveCodexDirectInvocation('codex', codexPath);
+      const spawnCmd = directInvocation ? directInvocation.command : codexPath;
+      const spawnArgs = directInvocation ? [...directInvocation.argsPrefix, ...args] : args;
+      const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(codexPath);
+
+      child = spawn(spawnCmd, spawnArgs, {
+        cwd: workingDirectory,
+        env: sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }),
+        windowsHide: true,
+        shell: isWindowsCmdShim && !directInvocation,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.on('data', (data) => { stdout += data.toString('utf8'); });
+      child.stderr?.on('data', (data) => { stderr += data.toString('utf8'); });
+      child.on('error', (error) => finish({ ok: false, stdout, stderr, error: error.message || String(error) }));
+      child.on('close', (code) => finish({
+        ok: Number(code) === 0,
+        stdout,
+        stderr,
+        error: Number(code) === 0 ? '' : (stderr.trim() || `codex debug models exited with code ${code}`),
+      }));
+
+      timer = setTimeout(() => {
+        try { child?.kill(); } catch { /* ignore */ }
+        finish({ ok: false, stdout, stderr, error: 'codex model catalog timed out' });
+      }, timeoutMs);
+    } catch (error) {
+      finish({ ok: false, stdout: '', stderr: '', error: error.message || String(error) });
+    }
+  });
+}
+
+async function fetchCodexModelCatalog() {
+  const attempts = [
+    { args: ['debug', 'models'], source: 'codex-debug' },
+    { args: ['debug', 'models', '--bundled'], source: 'codex-bundled' },
+  ];
+
+  for (const attempt of attempts) {
+    const result = await runCodexModelCatalogCommand(attempt.args);
+    if (!result.ok || !result.stdout.trim()) continue;
+    try {
+      const parsed = JSON.parse(result.stdout.trim());
+      const models = normalizeCodexModelCatalog(parsed, attempt.source);
+      if (models.length > 0) {
+        return { success: true, source: attempt.source, models };
+      }
+    } catch {
+      // Try the next source if Codex emitted non-JSON output.
+    }
+  }
+
+  return {
+    success: true,
+    source: 'fallback',
+    models: FALLBACK_CODEX_MODELS.map(model => ({ ...model })),
+  };
+}
+
 // --- CLI 실행 (node-pty 기반 PTY) ---
-ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
+ipcMain.handle('cli:run', (event, request = {}) => {
+  const { id, profile = {}, prompt, cwd } = request || {};
   const shell = profile.command;
+  if (!id || typeof id !== 'string') {
+    return { success: false, error: 'stream id required' };
+  }
+  if (runningProcesses.has(id)) {
+    return { success: false, error: 'stream id is already running' };
+  }
+  if (!isAllowedCliCommand(shell)) {
+    return { success: false, error: 'unsupported CLI command' };
+  }
   const promptText = typeof prompt === 'string' ? prompt : '';
-  const baseArgs = [...(profile.args || [])];
-  const runCwd = cwd || workingDirectory;
+  const baseArgs = normalizeCliArgs(profile.args);
+  const runCwd = resolveExistingDirectory(cwd, workingDirectory);
   const requestedMode = String(profile?.mode || '').trim().toLowerCase();
   const requestedPtyMode = requestedMode === 'pty' || requestedMode === 'interactive';
   const isJsonMode = baseArgs.some((arg) => String(arg).trim().toLowerCase() === '--json');
@@ -1015,8 +1222,7 @@ ipcMain.handle('cli:run', (event, { id, profile, prompt, cwd }) => {
           spawnCommand = powerShellExe;
           spawnArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path, ...args];
         } else {
-          // ps1 shim이 없으면 기존 방식으로 폴백
-          spawnOptions.shell = true;
+          throw new Error('codex .cmd shim cannot be launched safely without a .ps1 shim');
         }
       }
 
@@ -1241,9 +1447,17 @@ ipcMain.handle('cli:stop', (event, { id }) => {
 ipcMain.handle('cwd:get', () => workingDirectory);
 
 ipcMain.handle('cwd:set', (event, dir) => {
-  if (fs.existsSync(dir)) {
-    workingDirectory = dir;
-    return { success: true, cwd: dir };
+  const requested = String(dir || '').trim();
+  if (requested && fs.existsSync(requested)) {
+    try {
+      const stat = fs.statSync(requested);
+      if (stat.isDirectory()) {
+        workingDirectory = requested;
+        return { success: true, cwd: requested };
+      }
+    } catch {
+      // fall through
+    }
   }
   return { success: false, error: 'Directory not found' };
 });
@@ -1382,17 +1596,28 @@ ${detailDiff}`;
         spawnCmd = directInvocation.command;
         spawnArgs = [...directInvocation.argsPrefix, ...execArgs];
       } else {
-        // .cmd shim 사용 시 shell 필요
-        spawnCmd = codexPath;
-        spawnArgs = execArgs;
+        const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(codexPath);
+        const ps1Path = isWindowsCmdShim ? codexPath.replace(/\.cmd$/i, '.ps1') : '';
+        if (ps1Path && fs.existsSync(ps1Path)) {
+          spawnCmd = path.join(
+            process.env.SystemRoot || 'C:\\Windows',
+            'System32',
+            'WindowsPowerShell',
+            'v1.0',
+            'powershell.exe'
+          );
+          spawnArgs = ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', ps1Path, ...execArgs];
+        } else {
+          spawnCmd = codexPath;
+          spawnArgs = execArgs;
+        }
       }
 
-      const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(codexPath);
       const spawnOptions = {
         cwd: repoRoot,
         env: sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0' }),
         windowsHide: true,
-        shell: isWindowsCmdShim && !directInvocation,
+        shell: false,
         stdio: ['pipe', 'pipe', 'pipe'],
       };
 
@@ -2112,6 +2337,19 @@ ipcMain.handle('codex:rateLimits', async () => {
     return { success: false, error: 'no rate_limits found' };
   } catch (err) {
     return { success: false, error: err.message };
+  }
+});
+
+ipcMain.handle('codex:listModels', async () => {
+  try {
+    return await fetchCodexModelCatalog();
+  } catch (err) {
+    return {
+      success: true,
+      source: 'fallback',
+      error: err.message || String(err),
+      models: FALLBACK_CODEX_MODELS.map(model => ({ ...model })),
+    };
   }
 });
 
