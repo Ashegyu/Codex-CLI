@@ -61,6 +61,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   codex: {
     rateLimits: () => ipcRenderer.invoke('codex:rateLimits'),
     listModels: () => ipcRenderer.invoke('codex:listModels'),
+    listCommands: (arg) => ipcRenderer.invoke('codex:listCommands', arg),
     readConfig: () => ipcRenderer.invoke('codex:readConfig'),
     saveConfig: (arg) => ipcRenderer.invoke('codex:saveConfig', arg),
     openConfig: () => ipcRenderer.invoke('codex:openConfig'),

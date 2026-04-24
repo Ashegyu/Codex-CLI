@@ -14,6 +14,7 @@ const MAX_FILE_IMPORT_BYTES = 180 * 1024;
 const MAX_IMAGE_IMPORT_BYTES = 20 * 1024 * 1024; // 이미지는 20MB까지
 const MAX_PDF_IMPORT_BYTES = 10 * 1024 * 1024; // PDF는 10MB까지
 const CODEX_MODEL_CATALOG_TIMEOUT_MS = 8000;
+const CODEX_COMMAND_CATALOG_TIMEOUT_MS = 8000;
 const FALLBACK_CODEX_MODELS = [
   {
     id: 'gpt-5.4',
@@ -1147,6 +1148,124 @@ function runCodexModelCatalogCommand(args, timeoutMs = CODEX_MODEL_CATALOG_TIMEO
       finish({ ok: false, stdout: '', stderr: '', error: error.message || String(error) });
     }
   });
+}
+
+function runCodexInfoCommand(args, options = {}) {
+  const timeoutMs = Number(options.timeoutMs) || CODEX_COMMAND_CATALOG_TIMEOUT_MS;
+  const runCwd = resolveExistingDirectory(options.cwd, workingDirectory);
+  return new Promise((resolve) => {
+    let child = null;
+    let timer = null;
+    let settled = false;
+
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      if (timer) clearTimeout(timer);
+      resolve(result);
+    };
+
+    try {
+      const codexPath = resolveCliPath('codex');
+      const directInvocation = resolveCodexDirectInvocation('codex', codexPath);
+      const spawnCmd = directInvocation ? directInvocation.command : codexPath;
+      const spawnArgs = directInvocation ? [...directInvocation.argsPrefix, ...args] : args;
+      const isWindowsCmdShim = process.platform === 'win32' && /\.cmd$/i.test(codexPath);
+
+      child = spawn(spawnCmd, spawnArgs, {
+        cwd: runCwd,
+        env: sanitizeCliEnv({ ...process.env, FORCE_COLOR: '0', NO_COLOR: '1' }),
+        windowsHide: true,
+        shell: isWindowsCmdShim && !directInvocation,
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+
+      let stdout = '';
+      let stderr = '';
+      child.stdout?.on('data', (data) => { stdout += data.toString('utf8'); });
+      child.stderr?.on('data', (data) => { stderr += data.toString('utf8'); });
+      child.on('error', (error) => finish({ ok: false, stdout, stderr, error: error.message || String(error), cwd: runCwd }));
+      child.on('close', (code) => finish({
+        ok: Number(code) === 0,
+        stdout,
+        stderr,
+        error: Number(code) === 0 ? '' : (stderr.trim() || `codex info command exited with code ${code}`),
+        cwd: runCwd,
+      }));
+
+      timer = setTimeout(() => {
+        try { child?.kill(); } catch { /* ignore */ }
+        finish({ ok: false, stdout, stderr, error: 'codex info command timed out', cwd: runCwd });
+      }, timeoutMs);
+    } catch (error) {
+      finish({ ok: false, stdout: '', stderr: '', error: error.message || String(error), cwd: runCwd });
+    }
+  });
+}
+
+function parseCodexHelpCommands(helpText) {
+  const lines = String(helpText || '').split(/\r?\n/);
+  const commands = [];
+  let inCommands = false;
+  let current = null;
+
+  for (const line of lines) {
+    const trimmed = line.trimEnd();
+    if (/^Commands:\s*$/.test(trimmed)) {
+      inCommands = true;
+      continue;
+    }
+    if (!inCommands) continue;
+    if (/^(Arguments|Options):\s*$/.test(trimmed)) break;
+    if (!trimmed.trim()) {
+      current = null;
+      continue;
+    }
+
+    const commandMatch = trimmed.match(/^\s{2,}([a-z][a-z0-9-]*)(?:\s{2,}|\t+)(.+)$/i);
+    if (commandMatch) {
+      const name = commandMatch[1].trim();
+      let description = commandMatch[2].trim();
+      const aliases = [];
+      description = description.replace(/\[aliases?:\s*([^\]]+)\]/ig, (_, rawAliases) => {
+        rawAliases.split(',').map(item => item.trim()).filter(Boolean).forEach(alias => aliases.push(alias));
+        return '';
+      }).trim();
+      current = { name, description, aliases };
+      commands.push(current);
+      continue;
+    }
+
+    if (current && /^\s{12,}\S/.test(trimmed)) {
+      current.description = `${current.description} ${trimmed.trim()}`.trim();
+    }
+  }
+
+  const seen = new Set();
+  return commands.filter((command) => {
+    if (!command.name || seen.has(command.name)) return false;
+    seen.add(command.name);
+    return true;
+  });
+}
+
+async function fetchCodexCommandCatalog(cwd) {
+  const result = await runCodexInfoCommand(['--help'], { cwd, timeoutMs: CODEX_COMMAND_CATALOG_TIMEOUT_MS });
+  if (!result.ok || !result.stdout.trim()) {
+    return {
+      success: false,
+      source: 'codex-help',
+      cwd: result.cwd || resolveExistingDirectory(cwd, workingDirectory),
+      error: result.error || 'codex --help produced no output',
+      commands: [],
+    };
+  }
+  return {
+    success: true,
+    source: 'codex-help',
+    cwd: result.cwd || resolveExistingDirectory(cwd, workingDirectory),
+    commands: parseCodexHelpCommands(result.stdout),
+  };
 }
 
 async function fetchCodexModelCatalog() {
@@ -2557,6 +2676,21 @@ ipcMain.handle('codex:listModels', async () => {
       source: 'fallback',
       error: err.message || String(err),
       models: FALLBACK_CODEX_MODELS.map(model => ({ ...model })),
+    };
+  }
+});
+
+ipcMain.handle('codex:listCommands', async (event, arg = {}) => {
+  try {
+    const cwd = typeof arg?.cwd === 'string' ? arg.cwd : workingDirectory;
+    return await fetchCodexCommandCatalog(cwd);
+  } catch (err) {
+    return {
+      success: false,
+      source: 'codex-help',
+      cwd: resolveExistingDirectory(arg?.cwd, workingDirectory),
+      error: err.message || String(err),
+      commands: [],
     };
   }
 });

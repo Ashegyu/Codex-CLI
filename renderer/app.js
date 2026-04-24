@@ -885,6 +885,7 @@
     { command: '/model', description: '모델 변경', usage: '/model [모델명]' },
     { command: '/reasoning', description: 'Reasoning effort 변경', usage: '/reasoning [low|medium|high|extra high]' },
     { command: '/models', description: 'Codex CLI 모델 목록 새로고침/표시', usage: '/models' },
+    { command: '/commands', description: 'Codex CLI 명령어 목록 새로고침/표시', usage: '/commands' },
     { command: '/settings', description: 'Codex config.toml 설정', usage: '/settings' },
     { command: '/sandbox', description: '샌드박스 모드 변경', usage: '/sandbox [read-only|workspace-write|danger-full-access]' },
     { command: '/cwd', description: '작업 폴더 변경', usage: '/cwd [경로]' },
@@ -903,6 +904,9 @@
     { command: '/auto-agent', description: '작업 자동 분배 (AI가 에이전트 배정)', usage: '/auto-agent [작업 설명]' },
     { command: '/agents', description: '사용 가능한 에이전트 목록', usage: '/agents' },
   ];
+  let codexCommandOptions = [];
+  let codexCommandCatalogSource = 'none';
+  let codexCommandCatalogCwd = '';
   // 기본 모델 목록 (드롭다운 빠른 선택용) + 커스텀 입력 지원
   const FALLBACK_MODEL_OPTIONS = [
     { id: 'gpt-5.4', cliModel: 'gpt-5.4', label: 'gpt-5.4', source: 'fallback' },
@@ -1846,6 +1850,87 @@
     });
     const suffix = refreshed ? '' : '\n새로고침 실패로 현재 캐시/fallback 목록을 표시합니다.';
     showSlashFeedback(`Codex 모델 목록 (${getModelOptions().length}개, ${sourceLabel}):\n${lines.join('\n')}${suffix}`, false);
+  }
+
+  function normalizeCodexCommandOption(rawCommand) {
+    const name = String(rawCommand?.name || '').trim().toLowerCase();
+    if (!/^[a-z][a-z0-9-]*$/.test(name)) return null;
+    return {
+      name,
+      command: `/${name}`,
+      description: String(rawCommand?.description || 'Codex CLI 명령어').trim(),
+      aliases: Array.isArray(rawCommand?.aliases)
+        ? rawCommand.aliases.map(alias => String(alias || '').trim()).filter(Boolean)
+        : [],
+      usage: `/${name}${name === 'help' ? ' [명령어]' : ' [인자]'}`,
+      source: 'codex',
+    };
+  }
+
+  function setCodexCommandOptionsFromCatalog(commands, source, cwd) {
+    const normalized = [];
+    const seen = new Set();
+    for (const item of Array.isArray(commands) ? commands : []) {
+      const command = normalizeCodexCommandOption(item);
+      if (!command || seen.has(command.name)) continue;
+      seen.add(command.name);
+      normalized.push(command);
+    }
+    codexCommandOptions = normalized;
+    codexCommandCatalogSource = source || 'codex-help';
+    codexCommandCatalogCwd = cwd || currentCwd || '';
+    if (isSlashMenuOpen()) updateSlashCommandMenu();
+    return normalized.length > 0;
+  }
+
+  async function refreshCodexCommandOptions(cwd = currentCwd) {
+    if (!window.electronAPI?.codex?.listCommands) return false;
+    try {
+      const result = await window.electronAPI.codex.listCommands({ cwd: cwd || currentCwd || '' });
+      if (!result?.success || !Array.isArray(result.commands)) return false;
+      return setCodexCommandOptionsFromCatalog(result.commands, result.source || 'codex-help', result.cwd || cwd);
+    } catch (err) {
+      console.error('[commands] listCommands failed:', err);
+      return false;
+    }
+  }
+
+  async function showCodexCommandList() {
+    const refreshed = await refreshCodexCommandOptions(currentCwd);
+    const lines = codexCommandOptions.map((command) => {
+      const aliases = command.aliases.length ? ` (alias: ${command.aliases.join(', ')})` : '';
+      return `  /${command.name}${aliases} - ${command.description}`;
+    });
+    const cwdLabel = codexCommandCatalogCwd ? `, cwd: ${codexCommandCatalogCwd}` : '';
+    const suffix = refreshed ? '' : '\n새로고침 실패로 현재 캐시 목록을 표시합니다.';
+    const body = lines.length ? lines.join('\n') : '  로드된 Codex CLI 명령어가 없습니다.';
+    showSlashFeedback(`Codex CLI 명령어 (${codexCommandOptions.length}개, ${codexCommandCatalogSource}${cwdLabel}):\n${body}${suffix}`, false);
+  }
+
+  function getSlashCommands() {
+    const merged = [];
+    const seen = new Set();
+    const append = (item) => {
+      const command = String(item?.command || '').trim();
+      if (!command || seen.has(command)) return;
+      seen.add(command);
+      merged.push(item);
+    };
+    SLASH_COMMANDS.forEach(append);
+    codexCommandOptions.forEach((item) => append({
+      command: item.command,
+      description: `Codex: ${item.description}`,
+      usage: item.usage,
+      source: 'codex',
+      codexName: item.name,
+    }));
+    return merged;
+  }
+
+  function getDynamicCodexSlashCommand(command) {
+    const normalized = String(command || '').trim().replace(/^\//, '').toLowerCase();
+    if (!normalized) return null;
+    return codexCommandOptions.find(item => item.name === normalized) || null;
   }
 
   function normalizeModelOptionId(value) {
@@ -3352,8 +3437,9 @@
 
   function filterSlashCommands(token) {
     const normalized = String(token || '').toLowerCase();
-    if (!normalized || normalized === '/') return SLASH_COMMANDS.slice();
-    return SLASH_COMMANDS.filter(cmd => cmd.command.startsWith(normalized));
+    const commands = getSlashCommands();
+    if (!normalized || normalized === '/') return commands;
+    return commands.filter(cmd => cmd.command.startsWith(normalized));
   }
 
   function renderSlashMenu(items) {
@@ -3406,7 +3492,8 @@
     if (!isSlashMenuOpen() || slashMenuItems.length === 0) return false;
     const selected = slashMenuItems[slashSelectedIndex];
     if (!selected) return false;
-    $input.value = selected.command === '/file' ? '/file ' : selected.command;
+    const needsTrailingSpace = selected.command === '/file' || selected.source === 'codex';
+    $input.value = needsTrailingSpace ? `${selected.command} ` : selected.command;
     autoResizeInput();
     updateSlashCommandMenu();
     $input.focus();
@@ -3422,6 +3509,45 @@
     slashFeedbackTimer = setTimeout(() => {
       $slashFeedback.classList.add('hidden');
     }, 2600);
+  }
+
+  function splitShellLikeArgs(input) {
+    const args = [];
+    let current = '';
+    let quote = '';
+    let escaped = false;
+    for (const ch of String(input || '')) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === '\\' && quote !== "'") {
+        escaped = true;
+        continue;
+      }
+      if ((ch === '"' || ch === "'")) {
+        if (!quote) {
+          quote = ch;
+          continue;
+        }
+        if (quote === ch) {
+          quote = '';
+          continue;
+        }
+      }
+      if (!quote && /\s/.test(ch)) {
+        if (current) {
+          args.push(current);
+          current = '';
+        }
+        continue;
+      }
+      current += ch;
+    }
+    if (escaped) current += '\\';
+    if (current) args.push(current);
+    return args;
   }
 
   async function runFileSlashCommand(argText) {
@@ -3485,7 +3611,7 @@
       $input.value = '/';
       autoResizeInput();
       slashSelectedIndex = 0;
-      renderSlashMenu(SLASH_COMMANDS);
+      renderSlashMenu(getSlashCommands());
       $input.focus();
       return true;
     }
@@ -3510,6 +3636,11 @@
 
     if (command === '/models') {
       await showCodexModelList();
+      return true;
+    }
+
+    if (command === '/commands') {
+      await showCodexCommandList();
       return true;
     }
 
@@ -3845,6 +3976,14 @@
       } else {
         showAgentPicker(cleanArg);
       }
+      return true;
+    }
+
+    const dynamicCodexCommand = getDynamicCodexSlashCommand(command);
+    if (dynamicCodexCommand) {
+      const args = splitShellLikeArgs(argText);
+      showSlashFeedback(`Codex ${dynamicCodexCommand.name} 명령을 실행합니다...`, false);
+      await runCodexSubcommand(dynamicCodexCommand.name, args, '');
       return true;
     }
 
@@ -4306,6 +4445,7 @@
     });
     localStorage.setItem('lastCwd', resolvedPath);
     updateCwdDisplay();
+    void refreshCodexCommandOptions(resolvedPath);
 
     if (options.render !== false) {
       renderProjects();
@@ -4374,6 +4514,7 @@
   runInitStep('projects', () => renderProjects());
   runInitStep('active-profile', () => setActiveProfile(activeProfileId));
   runInitStep('model-catalog', () => refreshCodexModelOptions());
+  runInitStep('command-catalog', () => refreshCodexCommandOptions(currentCwd));
   runInitStep('statusbar', () => updateCodexStatusbar());
   runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
 
