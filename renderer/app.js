@@ -855,6 +855,7 @@
   const $codexStatusbar = document.getElementById('codex-statusbar');
   const $appVersion = document.getElementById('app-version');
   const $btnUserManual = document.getElementById('btn-user-manual');
+  const $btnCodexSettings = document.getElementById('btn-codex-settings');
 
   const SLASH_COMMANDS = [
     // --- Codex 실행 ---
@@ -884,6 +885,7 @@
     { command: '/model', description: '모델 변경', usage: '/model [모델명]' },
     { command: '/reasoning', description: 'Reasoning effort 변경', usage: '/reasoning [low|medium|high|extra high]' },
     { command: '/models', description: 'Codex CLI 모델 목록 새로고침/표시', usage: '/models' },
+    { command: '/settings', description: 'Codex config.toml 설정', usage: '/settings' },
     { command: '/sandbox', description: '샌드박스 모드 변경', usage: '/sandbox [read-only|workspace-write|danger-full-access]' },
     { command: '/cwd', description: '작업 폴더 변경', usage: '/cwd [경로]' },
     // --- 앱 기능 ---
@@ -910,7 +912,7 @@
   ];
   let modelOptions = FALLBACK_MODEL_OPTIONS.map(item => ({ ...item }));
   let modelCatalogSource = 'fallback';
-  const REASONING_OPTIONS = ['low', 'medium', 'high', 'extra high'];
+  const REASONING_OPTIONS = ['minimal', 'low', 'medium', 'high', 'extra high'];
   const DEFAULT_MODEL_ID = 'gpt-5.4';
   const DEFAULT_REASONING = 'extra high';
   const RUNTIME_INFO_VERSION = 3;
@@ -1749,7 +1751,7 @@
 
   function parseEffort(sections) {
     const text = sections.session.content + '\n' + sections.thinking.content;
-    const m = text.match(/(?:reasoning|effort)\s*[:=]\s*(low|medium|high|xhigh|extra[\s-]?high)/i);
+    const m = text.match(/(?:reasoning|effort)\s*[:=]\s*(minimal|low|medium|high|xhigh|extra[\s-]?high)/i);
     if (m) return m[1].toLowerCase().replace(/extra[\s-]?high/, 'xhigh');
     return 'medium';
   }
@@ -2108,6 +2110,314 @@
     updateRuntimeHint();
   }
 
+  const CODEX_CONFIG_SETTING_GROUPS = [
+    {
+      title: '기본 실행',
+      fields: [
+        { key: 'model', type: 'model', label: '기본 모델', placeholder: '예: gpt-5.4' },
+        { key: 'model_provider', type: 'text', label: '모델 제공자', placeholder: 'openai' },
+        { key: 'approval_policy', type: 'enum', label: '승인 정책', options: ['untrusted', 'on-request', 'on-failure', 'never'] },
+        { key: 'sandbox_mode', type: 'enum', label: '샌드박스', options: ['read-only', 'workspace-write', 'danger-full-access'] },
+      ],
+    },
+    {
+      title: '모델 응답',
+      fields: [
+        { key: 'model_reasoning_effort', type: 'enum', label: '추론 강도', options: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+        { key: 'model_reasoning_summary', type: 'enum', label: '추론 요약', options: ['auto', 'concise', 'detailed', 'none'] },
+        { key: 'model_verbosity', type: 'enum', label: '답변 상세도', options: ['low', 'medium', 'high'] },
+        { key: 'personality', type: 'enum', label: '응답 성격', options: ['friendly', 'pragmatic', 'none'] },
+      ],
+    },
+    {
+      title: '도구와 환경',
+      fields: [
+        { key: 'web_search', type: 'enum', label: '웹 검색', options: ['cached', 'live', 'disabled'] },
+        { key: 'windows.sandbox', type: 'enum', label: 'Windows 샌드박스', options: ['elevated', 'unelevated'] },
+        { key: 'openai_base_url', type: 'text', label: 'OpenAI 기본 URL', placeholder: '기본값 사용' },
+        { key: 'log_dir', type: 'text', label: '로그 폴더', placeholder: '기본값 사용' },
+      ],
+    },
+    {
+      title: '기능 플래그',
+      fields: [
+        { key: 'features.fast_mode', type: 'boolean', label: '빠른 모드' },
+        { key: 'features.multi_agent', type: 'boolean', label: '멀티 에이전트' },
+        { key: 'features.shell_snapshot', type: 'boolean', label: '셸 스냅샷' },
+        { key: 'features.shell_tool', type: 'boolean', label: '셸 도구' },
+        { key: 'features.memories', type: 'boolean', label: '메모리' },
+        { key: 'features.personality', type: 'boolean', label: '응답 성격 제어' },
+        { key: 'features.apps', type: 'boolean', label: '앱/커넥터' },
+        { key: 'features.undo', type: 'boolean', label: '되돌리기 스냅샷' },
+        { key: 'features.unified_exec', type: 'boolean', label: '통합 실행 도구' },
+      ],
+    },
+  ];
+
+  const CODEX_CONFIG_DOCS_URL = 'https://developers.openai.com/codex/config-reference';
+  const CODEX_CONFIG_OPTION_LABELS = {
+    approval_policy: {
+      untrusted: '허용 목록 외 확인 (untrusted)',
+      'on-request': '필요할 때 확인 (on-request)',
+      'on-failure': '실패 시 확인 (on-failure)',
+      never: '확인 안 함 (never)',
+    },
+    sandbox_mode: {
+      'read-only': '읽기 전용',
+      'workspace-write': '작업 폴더 쓰기',
+      'danger-full-access': '전체 접근 (위험)',
+    },
+    model_reasoning_effort: {
+      minimal: '최소',
+      low: '낮음',
+      medium: '보통',
+      high: '높음',
+      xhigh: '최고',
+    },
+    model_reasoning_summary: {
+      auto: '자동',
+      concise: '간단히',
+      detailed: '자세히',
+      none: '사용 안 함',
+    },
+    model_verbosity: {
+      low: '간결',
+      medium: '보통',
+      high: '자세히',
+    },
+    personality: {
+      friendly: '친근함',
+      pragmatic: '실용적',
+      none: '사용 안 함',
+    },
+    web_search: {
+      cached: '캐시 검색',
+      live: '실시간 검색',
+      disabled: '사용 안 함',
+    },
+    'windows.sandbox': {
+      elevated: '관리자 권한 샌드박스',
+      unelevated: '일반 권한 샌드박스',
+    },
+  };
+
+  function codexConfigApprovalToRuntime(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'never') return 'auto-approve';
+    if (normalized === 'untrusted') return 'unless-allow-listed';
+    if (normalized === 'on-request' || normalized === 'on-failure') return 'on-failure-or-unsafe';
+    return '';
+  }
+
+  function codexConfigReasoningToRuntime(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (normalized === 'xhigh') return 'extra high';
+    return normalized;
+  }
+
+  function formatCodexConfigOptionLabel(field, value) {
+    const raw = String(value || '');
+    return CODEX_CONFIG_OPTION_LABELS[field.key]?.[raw] || raw;
+  }
+
+  function renderCodexSettingControl(field, values) {
+    const rawValue = values && Object.prototype.hasOwnProperty.call(values, field.key)
+      ? values[field.key]
+      : '';
+    const current = rawValue === null || rawValue === undefined ? '' : String(rawValue);
+    const commonAttrs = `data-setting-key="${escapeHtml(field.key)}" data-setting-type="${escapeHtml(field.type)}"`;
+
+    if (field.type === 'model') {
+      const options = getModelOptions().map(model => `<option value="${escapeHtml(model.id)}">${escapeHtml(model.label || model.id)}</option>`).join('');
+      return `<input ${commonAttrs} list="codex-settings-model-list" value="${escapeHtml(current)}" placeholder="${escapeHtml(field.placeholder || '')}">
+        <datalist id="codex-settings-model-list">${options}</datalist>`;
+    }
+
+    if (field.type === 'text') {
+      return `<input ${commonAttrs} value="${escapeHtml(current)}" placeholder="${escapeHtml(field.placeholder || '기본값 사용')}">`;
+    }
+
+    if (field.type === 'boolean') {
+      const isBool = rawValue === true || rawValue === false;
+      const unsupported = current && !isBool;
+      const originalAttrs = unsupported
+        ? ` data-original="${escapeHtml(current)}" data-unsupported="true"`
+        : '';
+      const unsupportedOption = unsupported
+        ? `<option value="${escapeHtml(current)}" selected>현재 값 유지: ${escapeHtml(current)}</option>`
+        : '';
+      return `<select ${commonAttrs}${originalAttrs}>
+        <option value="" ${!current ? 'selected' : ''}>기본값</option>
+        ${unsupportedOption}
+        <option value="true" ${rawValue === true ? 'selected' : ''}>켜기</option>
+        <option value="false" ${rawValue === false ? 'selected' : ''}>끄기</option>
+      </select>`;
+    }
+
+    const optionValues = Array.isArray(field.options) ? field.options : [];
+    const isSupported = !current || optionValues.includes(current);
+    const unsupportedOption = current && !isSupported
+      ? `<option value="${escapeHtml(current)}" selected>현재 값 유지: ${escapeHtml(current)}</option>`
+      : '';
+    const originalAttrs = current && !isSupported
+      ? ` data-original="${escapeHtml(current)}" data-unsupported="true"`
+      : '';
+    return `<select ${commonAttrs}${originalAttrs}>
+      <option value="" ${!current ? 'selected' : ''}>기본값</option>
+      ${unsupportedOption}
+      ${optionValues.map(opt => `<option value="${escapeHtml(opt)}" ${opt === current ? 'selected' : ''}>${escapeHtml(formatCodexConfigOptionLabel(field, opt))}</option>`).join('')}
+    </select>`;
+  }
+
+  function renderCodexSettingsModal(configResult) {
+    const values = configResult?.values || {};
+    const groupsHtml = CODEX_CONFIG_SETTING_GROUPS.map(group => `
+      <section class="settings-section">
+        <h4>${escapeHtml(group.title)}</h4>
+        <div class="settings-grid">
+          ${group.fields.map(field => `
+            <label class="settings-field">
+              <span>${escapeHtml(field.label)}</span>
+              ${renderCodexSettingControl(field, values)}
+              <small>${escapeHtml(field.key)}</small>
+            </label>
+          `).join('')}
+        </div>
+      </section>
+    `).join('');
+
+    const pathLabel = configResult?.path || '~/.codex/config.toml';
+    return `
+      <div class="settings-dialog" role="dialog" aria-modal="true" aria-labelledby="codex-settings-title">
+        <div class="settings-header">
+          <div>
+            <h3 id="codex-settings-title">Codex 설정</h3>
+            <p>${escapeHtml(pathLabel)}</p>
+          </div>
+          <button class="settings-icon-btn settings-close" type="button" aria-label="닫기">×</button>
+        </div>
+        <div class="settings-note">
+          사용자 기본값은 <code>~/.codex/config.toml</code>에 저장됩니다. 앱 실행 인자와 현재 런타임 선택은 이 파일보다 우선 적용될 수 있습니다.
+        </div>
+        <form class="settings-form">
+          ${groupsHtml}
+        </form>
+        <div class="settings-status" aria-live="polite"></div>
+        <div class="settings-actions">
+          <button class="settings-secondary settings-open-file" type="button">config.toml 열기</button>
+          <button class="settings-doc-link settings-open-docs" type="button">공식 설정 문서</button>
+          <span class="settings-spacer"></span>
+          <button class="settings-secondary settings-cancel" type="button">취소</button>
+          <button class="settings-primary settings-save" type="button">저장</button>
+        </div>
+      </div>
+    `;
+  }
+
+  function collectCodexSettingsValues(form) {
+    const values = {};
+    for (const el of form.querySelectorAll('[data-setting-key]')) {
+      const key = el.dataset.settingKey;
+      const type = el.dataset.settingType;
+      const raw = String(el.value || '').trim();
+      if (el.dataset.unsupported === 'true' && raw === el.dataset.original) {
+        continue;
+      }
+      if (type === 'boolean') {
+        values[key] = raw === '' ? null : raw === 'true';
+      } else {
+        values[key] = raw || null;
+      }
+    }
+    return values;
+  }
+
+  function applyCodexConfigToRuntime(values) {
+    if (!values || typeof values !== 'object') return;
+    if (typeof values.model === 'string' && values.model.trim()) {
+      setRuntimeOption('model', values.model.trim());
+    }
+    const reasoning = codexConfigReasoningToRuntime(values.model_reasoning_effort);
+    if (REASONING_OPTIONS.includes(reasoning)) {
+      setRuntimeOption('reasoning', reasoning);
+    }
+    if (SANDBOX_OPTIONS.includes(values.sandbox_mode)) {
+      setRuntimeOption('sandbox', values.sandbox_mode);
+    }
+    const runtimeApproval = codexConfigApprovalToRuntime(values.approval_policy);
+    if (runtimeApproval) {
+      setRuntimeOption('approval', runtimeApproval);
+    }
+  }
+
+  async function openCodexSettingsModal() {
+    try {
+      await refreshCodexModelOptions();
+      const result = await window.electronAPI.codex.readConfig();
+      if (!result?.success) {
+        showSlashFeedback(result?.error || 'Codex 설정을 읽지 못했습니다.', true);
+        return;
+      }
+
+      document.getElementById('codex-settings-modal')?.remove();
+      const overlay = document.createElement('div');
+      overlay.id = 'codex-settings-modal';
+      overlay.className = 'settings-modal-overlay';
+      overlay.innerHTML = renderCodexSettingsModal(result);
+      document.body.appendChild(overlay);
+
+      const dialog = overlay.querySelector('.settings-dialog');
+      const form = overlay.querySelector('.settings-form');
+      const statusEl = overlay.querySelector('.settings-status');
+      const close = () => {
+        overlay.remove();
+        document.removeEventListener('keydown', escHandler);
+      };
+      const setStatus = (text, isError = false) => {
+        statusEl.textContent = text || '';
+        statusEl.classList.toggle('error', !!isError);
+      };
+      const escHandler = (event) => {
+        if (event.key === 'Escape') close();
+      };
+
+      overlay.addEventListener('click', (event) => {
+        if (event.target === overlay) close();
+      });
+      overlay.querySelector('.settings-close').addEventListener('click', close);
+      overlay.querySelector('.settings-cancel').addEventListener('click', close);
+      overlay.querySelector('.settings-open-file').addEventListener('click', async () => {
+        const opened = await window.electronAPI.codex.openConfig();
+        setStatus(opened?.success ? 'config.toml을 열었습니다.' : (opened?.error || 'config.toml을 열지 못했습니다.'), !opened?.success);
+      });
+      overlay.querySelector('.settings-open-docs').addEventListener('click', async () => {
+        const opened = await window.electronAPI.system.openExternal(CODEX_CONFIG_DOCS_URL);
+        setStatus(opened?.success ? '공식 설정 문서를 열었습니다.' : (opened?.error || '공식 문서를 열지 못했습니다.'), !opened?.success);
+      });
+      overlay.querySelector('.settings-save').addEventListener('click', async () => {
+        try {
+          const values = collectCodexSettingsValues(form);
+          setStatus('저장 중...');
+          const saved = await window.electronAPI.codex.saveConfig({ values });
+          if (!saved?.success) {
+            setStatus(saved?.error || '저장에 실패했습니다.', true);
+            return;
+          }
+          applyCodexConfigToRuntime(saved.values);
+          updateRuntimeHint();
+          setStatus('저장했습니다. 다음 Codex 실행부터 적용됩니다.');
+          showSlashFeedback('Codex 설정을 저장했습니다.', false);
+        } catch (err) {
+          setStatus(err?.message || '저장 중 오류가 발생했습니다.', true);
+        }
+      });
+      document.addEventListener('keydown', escHandler);
+      dialog.querySelector('[data-setting-key]')?.focus();
+    } catch (err) {
+      showSlashFeedback(err?.message || 'Codex 설정을 열지 못했습니다.', true);
+    }
+  }
+
   function extractCodexSessionId(sections) {
     if (!sections || !sections.session || !sections.session.content) return null;
     const m = sections.session.content.match(/session\s*id\s*:\s*(\S+)/i);
@@ -2240,7 +2550,9 @@
     args.push('--json');
     args.push('--model', getCodexCliModel(codexRuntimeInfo.model));
     const effort = normalizeReasoning(codexRuntimeInfo.reasoning);
-    if (effort === 'extra high') {
+    if (effort === 'minimal') {
+      args.push('-c', 'model_reasoning_effort=minimal');
+    } else if (effort === 'extra high') {
       args.push('-c', 'model_reasoning_effort=xhigh');
     } else if (effort === 'low' || effort === 'medium' || effort === 'high') {
       args.push('-c', `model_reasoning_effort=${effort}`);
@@ -3198,6 +3510,11 @@
 
     if (command === '/models') {
       await showCodexModelList();
+      return true;
+    }
+
+    if (command === '/settings') {
+      await openCodexSettingsModal();
       return true;
     }
 
@@ -10107,6 +10424,7 @@ ${userPrompt}
     let responseStarted = false;
     let finished = false;
     let exitCode = null;
+    let streamErrorMessage = '';
     let latestSections = null;
     let lastSectionsParsedAt = 0;
     const previewState = createStreamingPreviewState(
@@ -10877,6 +11195,12 @@ ${userPrompt}
     });
   }
 
+  if ($btnCodexSettings) {
+    $btnCodexSettings.addEventListener('click', () => {
+      void openCodexSettingsModal();
+    });
+  }
+
   // 힌트 칩 클릭
   document.querySelectorAll('.hint-chip').forEach(chip => {
     chip.addEventListener('click', () => {
@@ -10913,6 +11237,10 @@ ${userPrompt}
     if (e.ctrlKey && e.key === 'l') {
       e.preventDefault();
       $input.focus();
+    }
+    if (e.ctrlKey && e.key === ',') {
+      e.preventDefault();
+      void openCodexSettingsModal();
     }
   });
 

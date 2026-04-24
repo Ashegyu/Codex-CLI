@@ -61,6 +61,9 @@ contextBridge.exposeInMainWorld('electronAPI', {
   codex: {
     rateLimits: () => ipcRenderer.invoke('codex:rateLimits'),
     listModels: () => ipcRenderer.invoke('codex:listModels'),
+    readConfig: () => ipcRenderer.invoke('codex:readConfig'),
+    saveConfig: (arg) => ipcRenderer.invoke('codex:saveConfig', arg),
+    openConfig: () => ipcRenderer.invoke('codex:openConfig'),
     listSessions: (limit) => ipcRenderer.invoke('codex:listSessions', limit),
     loadSession: (arg) => ipcRenderer.invoke('codex:loadSession', arg),
     deleteSession: (arg) => ipcRenderer.invoke('codex:deleteSession', arg),
@@ -74,6 +77,7 @@ contextBridge.exposeInMainWorld('electronAPI', {
   },
   system: {
     info: () => ipcRenderer.invoke('system:info'),
+    openExternal: (url) => ipcRenderer.invoke('system:openExternal', url),
   },
 });
 

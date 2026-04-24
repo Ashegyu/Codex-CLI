@@ -52,6 +52,30 @@ const FALLBACK_CODEX_MODELS = [
     source: 'fallback',
   },
 ];
+const CODEX_CONFIG_FIELDS = {
+  model: { type: 'string', maxLength: 160 },
+  model_provider: { type: 'string', maxLength: 80 },
+  approval_policy: { type: 'enum', values: ['untrusted', 'on-request', 'on-failure', 'never'] },
+  sandbox_mode: { type: 'enum', values: ['read-only', 'workspace-write', 'danger-full-access'] },
+  model_reasoning_effort: { type: 'enum', values: ['minimal', 'low', 'medium', 'high', 'xhigh'] },
+  model_reasoning_summary: { type: 'enum', values: ['auto', 'concise', 'detailed', 'none'] },
+  model_verbosity: { type: 'enum', values: ['low', 'medium', 'high'] },
+  web_search: { type: 'enum', values: ['cached', 'live', 'disabled'] },
+  personality: { type: 'enum', values: ['friendly', 'pragmatic', 'none'] },
+  openai_base_url: { type: 'string', maxLength: 2048 },
+  log_dir: { type: 'string', maxLength: 4096 },
+  'windows.sandbox': { type: 'enum', values: ['elevated', 'unelevated'] },
+  'features.apps': { type: 'boolean' },
+  'features.fast_mode': { type: 'boolean' },
+  'features.memories': { type: 'boolean' },
+  'features.multi_agent': { type: 'boolean' },
+  'features.personality': { type: 'boolean' },
+  'features.shell_snapshot': { type: 'boolean' },
+  'features.shell_tool': { type: 'boolean' },
+  'features.unified_exec': { type: 'boolean' },
+  'features.undo': { type: 'boolean' },
+};
+const CODEX_CONFIG_FIELD_KEYS = Object.freeze(Object.keys(CODEX_CONFIG_FIELDS));
 
 // 파일 확장자별 분류
 const IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg', '.ico', '.tiff', '.tif']);
@@ -1149,6 +1173,190 @@ async function fetchCodexModelCatalog() {
     success: true,
     source: 'fallback',
     models: FALLBACK_CODEX_MODELS.map(model => ({ ...model })),
+  };
+}
+
+function getCodexConfigPath() {
+  return path.join(os.homedir(), '.codex', 'config.toml');
+}
+
+function stripTomlComment(rawValue) {
+  const text = String(rawValue || '');
+  let quote = '';
+  let escaped = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (escaped) {
+      escaped = false;
+      continue;
+    }
+    if (quote && ch === '\\') {
+      escaped = true;
+      continue;
+    }
+    if ((ch === '"' || ch === "'") && !quote) {
+      quote = ch;
+      continue;
+    }
+    if (quote && ch === quote) {
+      quote = '';
+      continue;
+    }
+    if (!quote && ch === '#') {
+      return text.slice(0, i).trim();
+    }
+  }
+  return text.trim();
+}
+
+function parseTomlPrimitive(rawValue) {
+  const value = stripTomlComment(rawValue);
+  if (!value) return '';
+  if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
+    const body = value.slice(1, -1);
+    return value.startsWith('"')
+      ? body.replace(/\\(["\\btnfr])/g, (match, ch) => {
+          const map = { '"': '"', '\\': '\\', b: '\b', t: '\t', n: '\n', f: '\f', r: '\r' };
+          return Object.prototype.hasOwnProperty.call(map, ch) ? map[ch] : match;
+        })
+      : body;
+  }
+  if (/^(true|false)$/i.test(value)) return /^true$/i.test(value);
+  if (/^[+-]?\d+(?:\.\d+)?$/.test(value)) return Number(value);
+  return value;
+}
+
+function parseCodexConfigValues(raw) {
+  const values = {};
+  let section = '';
+  for (const line of String(raw || '').split(/\r?\n/)) {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) continue;
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      section = sectionMatch[1].trim();
+      continue;
+    }
+    const settingMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!settingMatch) continue;
+    const localKey = settingMatch[1].trim();
+    const dottedKey = section ? `${section}.${localKey}` : localKey;
+    if (!Object.prototype.hasOwnProperty.call(CODEX_CONFIG_FIELDS, dottedKey)) continue;
+    values[dottedKey] = parseTomlPrimitive(settingMatch[2]);
+  }
+  return values;
+}
+
+function encodeTomlString(value) {
+  return `"${String(value || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\r/g, '\\r')
+    .replace(/\n/g, '\\n')}"`;
+}
+
+function formatTomlPrimitive(value, def) {
+  if (def.type === 'boolean') return value ? 'true' : 'false';
+  if (def.type === 'number') return String(Number(value));
+  return encodeTomlString(value);
+}
+
+function normalizeCodexConfigInput(key, value) {
+  const def = CODEX_CONFIG_FIELDS[key];
+  if (!def) return { ok: false, error: `unsupported setting: ${key}` };
+  if (value === null || value === undefined || value === '') {
+    return { ok: true, unset: true };
+  }
+  if (def.type === 'boolean') {
+    if (value === true || value === false) return { ok: true, value };
+    const normalized = String(value).trim().toLowerCase();
+    if (normalized === 'true') return { ok: true, value: true };
+    if (normalized === 'false') return { ok: true, value: false };
+    return { ok: false, error: `${key} must be boolean` };
+  }
+  if (def.type === 'enum') {
+    const normalized = String(value).trim().toLowerCase();
+    if (def.values.includes(normalized)) return { ok: true, value: normalized };
+    return { ok: false, error: `${key} must be one of: ${def.values.join(', ')}` };
+  }
+  const text = String(value).trim();
+  if (text.length > (def.maxLength || 4096)) {
+    return { ok: false, error: `${key} is too long` };
+  }
+  return { ok: true, value: text };
+}
+
+function splitCodexConfigKey(dottedKey) {
+  const parts = String(dottedKey || '').split('.');
+  if (parts.length === 1) return { section: '', localKey: parts[0] };
+  return { section: parts.slice(0, -1).join('.'), localKey: parts[parts.length - 1] };
+}
+
+function upsertTomlValue(raw, dottedKey, normalized) {
+  const { section, localKey } = splitCodexConfigKey(dottedKey);
+  const def = CODEX_CONFIG_FIELDS[dottedKey];
+  const lines = String(raw || '').split(/\r?\n/);
+  let currentSection = '';
+  let sectionStart = section ? -1 : 0;
+  let sectionEnd = lines.length;
+  let keyLine = -1;
+
+  for (let i = 0; i < lines.length; i++) {
+    const trimmed = lines[i].trim();
+    const sectionMatch = trimmed.match(/^\[([^\]]+)\]$/);
+    if (sectionMatch) {
+      if (sectionStart >= 0 && sectionEnd === lines.length) sectionEnd = i;
+      currentSection = sectionMatch[1].trim();
+      if (currentSection === section) {
+        sectionStart = i;
+        sectionEnd = lines.length;
+      }
+      continue;
+    }
+    if (currentSection !== section) continue;
+    const settingMatch = trimmed.match(/^([A-Za-z0-9_.-]+)\s*=/);
+    if (settingMatch && settingMatch[1].trim() === localKey) {
+      keyLine = i;
+      break;
+    }
+  }
+
+  if (normalized.unset) {
+    if (keyLine >= 0) lines.splice(keyLine, 1);
+    return lines.join('\n').replace(/\s+$/g, '') + '\n';
+  }
+
+  const nextLine = `${localKey} = ${formatTomlPrimitive(normalized.value, def)}`;
+  if (keyLine >= 0) {
+    lines[keyLine] = nextLine;
+    return lines.join('\n').replace(/\s+$/g, '') + '\n';
+  }
+
+  if (!section) {
+    let insertAt = 0;
+    while (insertAt < lines.length && lines[insertAt].trim().startsWith('#')) insertAt++;
+    lines.splice(insertAt, 0, nextLine);
+    return lines.join('\n').replace(/\s+$/g, '') + '\n';
+  }
+
+  if (sectionStart >= 0) {
+    lines.splice(sectionEnd, 0, nextLine);
+  } else {
+    if (lines.length && lines[lines.length - 1].trim()) lines.push('');
+    lines.push(`[${section}]`, nextLine);
+  }
+  return lines.join('\n').replace(/\s+$/g, '') + '\n';
+}
+
+function readCodexConfigFile() {
+  const filePath = getCodexConfigPath();
+  if (!fs.existsSync(filePath)) {
+    return { filePath, exists: false, raw: '' };
+  }
+  return {
+    filePath,
+    exists: true,
+    raw: fs.readFileSync(filePath, 'utf8'),
   };
 }
 
@@ -2353,6 +2561,64 @@ ipcMain.handle('codex:listModels', async () => {
   }
 });
 
+ipcMain.handle('codex:readConfig', () => {
+  try {
+    const { filePath, exists, raw } = readCodexConfigFile();
+    return {
+      success: true,
+      path: filePath,
+      exists,
+      values: parseCodexConfigValues(raw),
+      fields: CODEX_CONFIG_FIELD_KEYS,
+    };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle('codex:saveConfig', (event, payload = {}) => {
+  try {
+    const incoming = payload && typeof payload === 'object' && payload.values && typeof payload.values === 'object'
+      ? payload.values
+      : {};
+    let { filePath, raw } = readCodexConfigFile();
+    for (const key of CODEX_CONFIG_FIELD_KEYS) {
+      if (!Object.prototype.hasOwnProperty.call(incoming, key)) continue;
+      const normalized = normalizeCodexConfigInput(key, incoming[key]);
+      if (!normalized.ok) {
+        return { success: false, error: normalized.error };
+      }
+      raw = upsertTomlValue(raw, key, normalized);
+    }
+
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    fs.writeFileSync(filePath, raw, 'utf8');
+    const saved = readCodexConfigFile();
+    return {
+      success: true,
+      path: filePath,
+      exists: true,
+      values: parseCodexConfigValues(saved.raw),
+      fields: CODEX_CONFIG_FIELD_KEYS,
+    };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
+ipcMain.handle('codex:openConfig', async () => {
+  try {
+    const filePath = getCodexConfigPath();
+    fs.mkdirSync(path.dirname(filePath), { recursive: true });
+    if (!fs.existsSync(filePath)) fs.writeFileSync(filePath, '', 'utf8');
+    const openError = await shell.openPath(filePath);
+    if (openError) return { success: false, error: openError, path: filePath };
+    return { success: true, path: filePath };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
+
 function getCodexSessionsDir() {
   return path.join(os.homedir(), '.codex', 'sessions');
 }
@@ -2869,6 +3135,19 @@ ipcMain.handle('system:info', () => ({
   appVersion: app.getVersion(),
   electronVersion: process.versions.electron,
 }));
+
+ipcMain.handle('system:openExternal', async (event, rawUrl) => {
+  try {
+    const url = new URL(String(rawUrl || ''));
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') {
+      return { success: false, error: 'unsupported URL protocol' };
+    }
+    await shell.openExternal(url.toString());
+    return { success: true };
+  } catch (err) {
+    return { success: false, error: err.message || String(err) };
+  }
+});
 
 // --- 대화 데이터 파일 기반 저장/로드 ---
 function getConversationsPath() {
