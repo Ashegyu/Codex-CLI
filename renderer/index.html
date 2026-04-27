@@ -88,23 +88,26 @@
 
     <!-- 채팅 영역 -->
     <section id="chat-area">
-      <!-- 메시지 리스트 -->
-      <div id="messages">
-        <div id="welcome" class="welcome-screen">
-          <div class="welcome-icon">
-            <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
-              <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
-            </svg>
-          </div>
-          <h2>CLI Chat</h2>
-          <p>AI에게 무엇이든 물어보세요.<br>코드, 분석, 디버깅 — 모두 가능합니다.</p>
-          <div class="welcome-hints">
-            <button class="hint-chip" data-prompt="현재 디렉토리의 파일 구조를 분석해줘">파일 구조 분석</button>
-            <button class="hint-chip" data-prompt="Python으로 간단한 웹 서버를 만드는 코드를 작성해줘">Python 웹 서버</button>
-            <button class="hint-chip" data-prompt="Git 브랜치 전략에 대해 설명해줘">Git 브랜치 전략</button>
-            <button class="hint-chip" data-prompt="이 코드를 리팩토링해줘: function add(a,b){return a+b}">코드 리팩토링</button>
+      <div id="conversation-split">
+        <!-- 메시지 리스트 -->
+        <div id="messages">
+          <div id="welcome" class="welcome-screen">
+            <div class="welcome-icon">
+              <svg width="52" height="52" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.1" stroke-linecap="round" stroke-linejoin="round">
+                <path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/>
+              </svg>
+            </div>
+            <h2>CLI Chat</h2>
+            <p>AI에게 무엇이든 물어보세요.<br>코드, 분석, 디버깅 — 모두 가능합니다.</p>
+            <div class="welcome-hints">
+              <button class="hint-chip" data-prompt="현재 디렉토리의 파일 구조를 분석해줘">파일 구조 분석</button>
+              <button class="hint-chip" data-prompt="Python으로 간단한 웹 서버를 만드는 코드를 작성해줘">Python 웹 서버</button>
+              <button class="hint-chip" data-prompt="Git 브랜치 전략에 대해 설명해줘">Git 브랜치 전략</button>
+              <button class="hint-chip" data-prompt="이 코드를 리팩토링해줘: function add(a,b){return a+b}">코드 리팩토링</button>
+            </div>
           </div>
         </div>
+        <aside id="subagent-rail" class="hidden" aria-label="서브에이전트 진행 패널"></aside>
       </div>
       <button id="btn-scroll-top" class="scroll-top-btn hidden" title="맨 위로 스크롤" aria-label="맨 위로 스크롤">
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="18 15 12 9 6 15"/></svg>
@@ -149,7 +152,7 @@
           <span class="sep">·</span>
           <span>Enter 전송 · Shift+Enter 줄바꿈 · @파일경로 불러오기 · / 명령어 목록</span>
           <span class="sep">·</span>
-          <button id="btn-subagent-autoclose" class="runtime-hint runtime-select-btn subagent-autoclose-btn" type="button" title="서브에이전트 완료 시 자동 닫기 설정">에이전트: 유지</button>
+          <button id="btn-subagent-autoclose" class="runtime-hint runtime-select-btn subagent-autoclose-btn" type="button" title="서브에이전트는 현재 대화에 분할 패널로 표시됩니다">에이전트: 현재창</button>
         </div>
         <div id="runtime-selector-menu" class="hidden" role="listbox" aria-label="런타임 설정 선택"></div>
         <div id="codex-statusbar" aria-live="polite"></div>

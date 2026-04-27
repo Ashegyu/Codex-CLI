@@ -3,5 +3,7 @@ dist/
 dist2/
 build_out/
 dist-temp/
+dist-temp*/
+.claude/settings.local.json
 *.exe
 *.blockmap

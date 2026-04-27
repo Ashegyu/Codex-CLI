@@ -9,6 +9,31 @@
     try { console.error('[renderer-rejection]', event?.reason || event); } catch { /* ignore */ }
   });
 
+  function normalizeSubagentPanel(raw) {
+    if (!raw || typeof raw !== 'object') return null;
+    const status = String(raw.status || 'pending').toLowerCase();
+    const progressLines = Array.isArray(raw.progressLines)
+      ? raw.progressLines
+          .map(line => String(line || '').trim())
+          .filter(Boolean)
+          .slice(-80)
+      : [];
+    return {
+      id: typeof raw.id === 'string' && raw.id ? raw.id : `subagent_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
+      agentName: String(raw.agentName || '서브에이전트'),
+      description: String(raw.description || ''),
+      prompt: String(raw.prompt || ''),
+      status: ['running', 'completed', 'error', 'pending'].includes(status) ? status : 'pending',
+      result: String(raw.result || ''),
+      error: String(raw.error || ''),
+      codexSessionId: typeof raw.codexSessionId === 'string' ? raw.codexSessionId : '',
+      startedAt: Number.isFinite(Number(raw.startedAt)) ? Number(raw.startedAt) : Date.now(),
+      finishedAt: Number.isFinite(Number(raw.finishedAt)) ? Number(raw.finishedAt) : 0,
+      elapsedMs: Number.isFinite(Number(raw.elapsedMs)) ? Number(raw.elapsedMs) : 0,
+      progressLines,
+    };
+  }
+
   function normalizeConversations(parsed) {
     if (!Array.isArray(parsed)) return [];
     const normalized = [];
@@ -47,7 +72,7 @@
                 }))
                 .filter(att => att.fileName || att.path)
             : [];
-          return {
+          const normalizedMsg = {
             id: typeof msg.id === 'string' && msg.id ? msg.id : `msg_${Date.now()}_${Math.random().toString(16).slice(2, 8)}`,
             role: msg.role === 'user' || msg.role === 'error' ? msg.role : 'ai',
             content: typeof msg.content === 'string' ? msg.content : '',
@@ -57,6 +82,9 @@
             actualCodeDiffs,
             actualCodeDiffsFetchedAt,
           };
+          const subagentPanel = normalizeSubagentPanel(msg.subagentPanel);
+          if (subagentPanel) normalizedMsg.subagentPanel = subagentPanel;
+          return normalizedMsg;
         });
       const cwd = typeof item.cwd === 'string' ? item.cwd : '';
       const codexSessionId = typeof item.codexSessionId === 'string' ? item.codexSessionId : null;
@@ -822,12 +850,17 @@
   const SIDEBAR_PREF_COLLAPSED_KEY = 'sidebarCollapsed';
   const SIDEBAR_MIN_WIDTH = 280;
   const SIDEBAR_MAX_WIDTH = 560;
+  const SIDEBAR_AUTO_CLOSE_MS = 7000;
   let sidebarWidthPx = null;
   let sidebarCollapsed = false;
   let sidebarResizeSession = null;
+  let sidebarTemporaryOpen = false;
+  let sidebarAutoCloseTimer = null;
 
   // === DOM ===
   const $messages = document.getElementById('messages');
+  const $conversationSplit = document.getElementById('conversation-split');
+  const $subagentRail = document.getElementById('subagent-rail');
   const $sidebar = document.getElementById('sidebar');
   const $sidebarResizer = document.getElementById('sidebar-resizer');
   const $welcome = document.getElementById('welcome');
@@ -965,7 +998,6 @@
   let codexRuntimeInfo = loadCodexRuntimeInfo();
   const codexExecutionMode = 'exec';
   let sandboxMode = localStorage.getItem('codexSandboxMode') || 'workspace-write';
-  let subagentAutoClose = localStorage.getItem('subagentAutoClose') === 'true';
   const APPROVAL_POLICY_OPTIONS = ['auto-approve', 'on-failure-or-unsafe', 'unless-allow-listed', 'always-prompt'];
   const APPROVAL_POLICY_LABELS = {
     'auto-approve': '자동 승인 (기본)',
@@ -4058,13 +4090,12 @@
         showAgentPicker();
         return true;
       }
-      // --auto-close 플래그 파싱
-      const hasAutoClose = /--auto-?close/i.test(argText);
+      // 이전 버전의 --auto-close 플래그는 현재창 패널 표시와 호환되도록 무시한다.
       const cleanArg = argText.replace(/--auto-?close\s*/gi, '').trim();
       // /subagent [에이전트명] [프롬프트]
       const parts = cleanArg.match(/^(\S+)\s+(.+)$/s);
       if (parts) {
-        await spawnSubagentByName(parts[1], parts[2], { autoClose: hasAutoClose });
+        await spawnSubagentByName(parts[1], parts[2]);
       } else {
         showAgentPicker(cleanArg);
       }
@@ -4129,16 +4160,47 @@
 
   function applySidebarState() {
     document.body.classList.toggle('sidebar-collapsed', sidebarCollapsed);
+    document.body.classList.toggle('sidebar-temporary-open', sidebarTemporaryOpen && !sidebarCollapsed);
     applySidebarWidth();
     updateSidebarToggleUI();
   }
 
-  function setSidebarCollapsed(nextCollapsed) {
+  function clearSidebarAutoCloseTimer() {
+    if (!sidebarAutoCloseTimer) return;
+    clearTimeout(sidebarAutoCloseTimer);
+    sidebarAutoCloseTimer = null;
+  }
+
+  function scheduleSidebarAutoClose() {
+    clearSidebarAutoCloseTimer();
+    if (!sidebarTemporaryOpen || sidebarCollapsed) return;
+    sidebarAutoCloseTimer = setTimeout(() => {
+      if (sidebarTemporaryOpen && !sidebarCollapsed && !sidebarResizeSession) {
+        setSidebarCollapsed(true, { save: false });
+      }
+    }, SIDEBAR_AUTO_CLOSE_MS);
+  }
+
+  function setSidebarCollapsed(nextCollapsed, options = {}) {
     const next = Boolean(nextCollapsed);
-    if (sidebarCollapsed === next) return;
+    const temporary = !next && Boolean(options.temporary);
+    const changed = sidebarCollapsed !== next || sidebarTemporaryOpen !== temporary;
     sidebarCollapsed = next;
-    saveSidebarPrefs();
+    sidebarTemporaryOpen = temporary;
+    if (next) clearSidebarAutoCloseTimer();
+    else scheduleSidebarAutoClose();
+    if (options.save !== false && !sidebarTemporaryOpen) saveSidebarPrefs();
+    if (!changed) return;
     applySidebarState();
+  }
+
+  function openSidebarTemporarily() {
+    setSidebarCollapsed(false, { temporary: true, save: false });
+  }
+
+  function closeSidebarFromOutside() {
+    if (sidebarCollapsed) return;
+    setSidebarCollapsed(true, { save: !sidebarTemporaryOpen });
   }
 
   function setSidebarWidth(nextWidth, options = {}) {
@@ -4199,17 +4261,35 @@
       }
     });
 
-    /* -- Left-edge hover zone: reopen sidebar when mouse enters left 6px -- */
+    /* -- Left-edge hover zone: temporarily reopen sidebar when mouse enters left edge -- */
     const hoverZone = document.createElement('div');
     hoverZone.id = 'sidebar-hover-zone';
     document.body.appendChild(hoverZone);
     let hoverTimer = null;
     hoverZone.addEventListener('mouseenter', () => {
       if (!sidebarCollapsed) return;
-      hoverTimer = setTimeout(() => setSidebarCollapsed(false), 120);
+      hoverTimer = setTimeout(openSidebarTemporarily, 120);
     });
     hoverZone.addEventListener('mouseleave', () => {
       if (hoverTimer) { clearTimeout(hoverTimer); hoverTimer = null; }
+    });
+
+    if ($sidebar) {
+      $sidebar.addEventListener('pointerenter', clearSidebarAutoCloseTimer);
+      $sidebar.addEventListener('pointerleave', scheduleSidebarAutoClose);
+      $sidebar.addEventListener('focusin', clearSidebarAutoCloseTimer);
+      $sidebar.addEventListener('focusout', scheduleSidebarAutoClose);
+    }
+
+    /* -- Outside click closes sidebar -- */
+    document.addEventListener('pointerdown', (e) => {
+      if (sidebarCollapsed) return;
+      const target = e.target;
+      if ($sidebar?.contains(target)) return;
+      if ($btnSidebarToggle?.contains(target)) return;
+      if ($sidebarResizer?.contains(target)) return;
+      if (hoverZone.contains(target)) return;
+      closeSidebarFromOutside();
     });
 
     /* -- Click on dim backdrop closes sidebar -- */
@@ -4221,7 +4301,7 @@
         if (e.target !== $main) return;
         const sidebar = document.getElementById('sidebar');
         if (sidebar && sidebar.contains(e.target)) return;
-        setSidebarCollapsed(true);
+        closeSidebarFromOutside();
       });
     }
   }
@@ -4623,27 +4703,20 @@
   runInitStep('statusbar', () => updateCodexStatusbar());
   runInitStep('rate-limits', () => refreshCodexRateLimits('init'));
 
-  // 서브에이전트 자동닫기 버튼
+  // 서브에이전트 표시 방식 안내
   const $btnSubagentAutoClose = document.getElementById('btn-subagent-autoclose');
   function updateSubagentAutoCloseBtn() {
     if (!$btnSubagentAutoClose) return;
-    if (subagentAutoClose) {
-      $btnSubagentAutoClose.textContent = '에이전트: 자동닫기';
-      $btnSubagentAutoClose.classList.add('is-active');
-    } else {
-      $btnSubagentAutoClose.textContent = '에이전트: 유지';
-      $btnSubagentAutoClose.classList.remove('is-active');
-    }
+    $btnSubagentAutoClose.textContent = '에이전트: 현재창';
+    $btnSubagentAutoClose.title = '서브에이전트는 현재 대화에 분할 패널로 표시됩니다';
+    $btnSubagentAutoClose.classList.add('is-active');
   }
   updateSubagentAutoCloseBtn();
   if ($btnSubagentAutoClose) {
     $btnSubagentAutoClose.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      subagentAutoClose = !subagentAutoClose;
-      localStorage.setItem('subagentAutoClose', subagentAutoClose ? 'true' : 'false');
-      updateSubagentAutoCloseBtn();
-      showSlashFeedback(`서브에이전트 완료 시 ${subagentAutoClose ? '자동 닫기 (결과를 부모에 합침)' : '대화 유지'}`, false);
+      showSlashFeedback('서브에이전트는 현재 대화 안의 분할 패널로 표시됩니다.', false);
     });
   }
 
@@ -4891,8 +4964,8 @@
   }
 
   // 스트리밍 중 주기적 자동 저장 (5초마다)
-  function autoSaveIfNeeded() {
-    if (convStreams.size > 0 && Date.now() - lastAutoSave >= AUTO_SAVE_INTERVAL) {
+  function autoSaveIfNeeded(force = false) {
+    if ((force || convStreams.size > 0) && Date.now() - lastAutoSave >= AUTO_SAVE_INTERVAL) {
       lastAutoSave = Date.now();
       window.electronAPI.store.saveConversations(_stripBinaryForSave(conversations)).catch(() => {});
     }
@@ -5151,10 +5224,9 @@
               <textarea class="agent-picker-prompt" rows="3" placeholder="서브에이전트에게 맡길 작업을 입력하세요..."></textarea>
             </div>
             <div class="agent-picker-section agent-picker-options">
-              <label class="agent-picker-checkbox-label">
-                <input type="checkbox" class="agent-picker-autoclose" ${subagentAutoClose ? 'checked' : ''} />
-                <span>자동 닫기 — 완료 시 결과를 부모 대화에 합치고 서브에이전트 삭제</span>
-              </label>
+              <div class="agent-picker-inline-note">
+                서브에이전트는 현재 대화 안에 분할 패널로 표시됩니다.
+              </div>
             </div>
           </div>
           <div class="agent-picker-footer">
@@ -5193,9 +5265,8 @@
           setTimeout(() => $promptInput.classList.remove('error'), 1500);
           return;
         }
-        const autoClose = modal.querySelector('.agent-picker-autoclose')?.checked ?? false;
         closeModal();
-        await spawnSubagentByName(selectedAgentName, prompt, { autoClose });
+        await spawnSubagentByName(selectedAgentName, prompt);
       });
 
       // Esc 닫기
@@ -5222,39 +5293,51 @@
   }
 
   async function spawnSubagent(agent, prompt, options = {}) {
-    const autoClose = options.autoClose ?? false;
-    const parentConv = getActiveConversation();
-    const parentId = parentConv?.id || null;
-    const targetCwd = currentCwd || getSelectedProjectPath() || '';
+    const parentId = String(options.parentConvId || activeConvId || '').trim();
+    let parentConv = parentId ? _convMap.get(parentId) : getActiveConversation();
+    const targetCwd = parentConv?.cwd || currentCwd || getSelectedProjectPath() || '';
 
     if (!targetCwd) {
       showSlashFeedback('프로젝트를 먼저 선택하세요.', true);
       return;
     }
 
-    // 서브에이전트용 대화 생성
-    const subConv = {
-      id: `conv_${Date.now()}_sub_${Math.random().toString(16).slice(2, 6)}`,
-      title: `[${agent.name}] ${prompt.slice(0, 40)}${prompt.length > 40 ? '...' : ''}`,
-      messages: [],
+    if (!parentConv) {
+      parentConv = newConversation(targetCwd);
+      if (!parentConv) return;
+    }
+
+    const panelMsg = {
+      id: `msg_${Date.now()}_sub_${Math.random().toString(16).slice(2, 6)}`,
+      role: 'ai',
+      content: '',
       profileId: activeProfileId,
-      cwd: targetCwd,
-      codexSessionId: null,
-      lastCodexApprovalPolicy: '',
-      parentConvId: parentId,
-      subagentMeta: {
+      timestamp: Date.now(),
+      subagentPanel: {
+        id: `subagent_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
         agentName: agent.name,
         description: agent.description,
+        prompt,
         status: 'running',
+        result: '',
+        error: '',
+        codexSessionId: '',
+        startedAt: Date.now(),
+        finishedAt: 0,
+        elapsedMs: 0,
+        progressLines: [],
       },
     };
 
-    conversations.unshift(subConv);
-    _convMap.set(subConv.id, subConv);
+    parentConv.messages.push(panelMsg);
     saveConversations();
-    renderHistory();
+    if (activeConvId === parentConv.id) {
+      $welcome.style.display = 'none';
+      renderSubagentRail(parentConv);
+      scrollToBottom({ force: true });
+    }
 
-    showSlashFeedback(`서브에이전트 '${agent.name}' 생성됨: ${prompt.slice(0, 50)}`, false);
+    showSlashFeedback(`서브에이전트 '${agent.name}' 패널을 현재 대화에 추가했습니다.`, false);
 
     // 서브에이전트 프롬프트: developer_instructions + 사용자 프롬프트
     const systemPrefix = agent.developer_instructions
@@ -5262,54 +5345,21 @@
       : '';
     const fullPrompt = systemPrefix + prompt;
 
-    // 사용자 메시지 추가
-    const userMsg = {
-      id: `msg_${Date.now()}`,
-      role: 'user',
-      content: prompt,
-      profileId: activeProfileId,
-      timestamp: Date.now(),
-    };
-    subConv.messages.push(userMsg);
-
-    // AI 응답 플레이스홀더
-    const aiMsg = {
-      id: `msg_${Date.now() + 1}`,
-      role: 'ai',
-      content: '',
-      profileId: activeProfileId,
-      timestamp: Date.now(),
-    };
-    subConv.messages.push(aiMsg);
-
-    const streamId = aiMsg.id;
+    const streamId = panelMsg.id;
     const profile = PROFILES.find(p => p.id === activeProfileId);
     let fullOutput = '';
 
-    aiMsg.content = '';
-    aiMsg._subagentStreaming = true;
-
     // 서브에이전트 스트리밍 진행 상태
     const subPreviewState = createStreamingPreviewState(19);
-    const startTime = Date.now();
+    const panel = panelMsg.subagentPanel;
 
-    // 서브에이전트 대화를 보고 있으면 thinking-log 갱신
-    function renderSubagentProgress() {
-      if (activeConvId !== subConv.id) return;
-      const aiEl = document.querySelector(`.message[data-msg-id="${aiMsg.id}"]`);
-      if (!aiEl) return;
-      const logEl = aiEl.querySelector('.thinking-log');
-      renderThinkingLogLines(logEl, subPreviewState.lines);
-      // 경과 시간
-      const elapsedEl = aiEl.querySelector('.thinking-elapsed');
-      if (elapsedEl) {
-        const sec = Math.floor((Date.now() - startTime) / 1000);
-        elapsedEl.textContent = sec < 60 ? `${sec}초` : `${Math.floor(sec / 60)}분 ${sec % 60}초`;
-      }
-      scrollToBottom();
+    function updateSubagentProgress(options = {}) {
+      panel.elapsedMs = Date.now() - panel.startedAt;
+      panel.progressLines = subPreviewState.lines.slice(-80);
+      updateSubagentPanelDom(panelMsg, parentConv.id, options);
     }
 
-    const subProgressTimer = setInterval(renderSubagentProgress, 1000);
+    const subProgressTimer = setInterval(updateSubagentProgress, 1000);
     let subagentFinished = false;
 
     function cleanupSubagentRun() {
@@ -5319,7 +5369,6 @@
       try { unsubDone(); } catch { /* ignore */ }
       try { unsubError(); } catch { /* ignore */ }
       clearInterval(subProgressTimer);
-      aiMsg._subagentStreaming = false;
       return true;
     }
 
@@ -5331,13 +5380,14 @@
           const normalized = normalizeDetailLine(String(chunk || ''));
           if (normalized) pushStreamingPreviewLine(subPreviewState, normalized);
         }
-        renderSubagentProgress();
+        updateSubagentProgress();
         return;
       }
       fullOutput += String(chunk || '');
       // 청크에서 진행 상태 추출
       updateStreamingPreviewFromChunk(subPreviewState, String(chunk || ''));
-      renderSubagentProgress();
+      updateSubagentProgress();
+      autoSaveIfNeeded(true);
     });
 
     const unsubDone = window.electronAPI.cli.onDone(({ id, code }) => {
@@ -5347,55 +5397,39 @@
       // Codex 출력을 파싱하여 response 섹션만 저장
       const sections = parseCodexOutput(fullOutput);
       const parsed = sections?.response?.content || '';
-      aiMsg.content = parsed || fullOutput;
+      const finalText = parsed || fullOutput;
+      panel.result = finalText;
+      panel.status = (code === 0 || code === null) ? 'completed' : 'error';
+      panel.finishedAt = Date.now();
+      panel.elapsedMs = panel.finishedAt - panel.startedAt;
+      panel.progressLines = subPreviewState.lines.slice(-80);
+      panelMsg.content = finalText;
 
-      subConv.subagentMeta.status = (code === 0 || code === null) ? 'completed' : 'error';
+      if (panel.status === 'error' && !panel.error) {
+        panel.error = `실행이 실패했습니다 (code ${code}).`;
+      }
 
       // 세션 ID 캡처
       const sidMatch = fullOutput.match(/session[_\s]*(?:id)?[:\s]*([a-f0-9-]{8,})/i);
-      if (sidMatch) subConv.codexSessionId = sidMatch[1];
+      if (sidMatch) panel.codexSessionId = sidMatch[1];
 
       saveConversations();
-
-      // 자동 닫기: 결과를 부모 대화에 합치고 서브에이전트 삭제
-      if (autoClose && parentId) {
-        const parent = _convMap.get(parentId);
-        if (parent) {
-          parent.messages.push({
-            id: `msg_${Date.now()}_agent`,
-            role: 'ai',
-            content: `**[${agent.name}]** 결과:\n\n${aiMsg.content}`,
-            profileId: activeProfileId,
-            timestamp: Date.now(),
-          });
-          // 서브에이전트 대화 삭제
-          const idx = conversations.findIndex(c => c.id === subConv.id);
-          if (idx >= 0) conversations.splice(idx, 1);
-          _convMap.delete(subConv.id);
-          // 현재 서브에이전트 보고 있었으면 부모로 전환
-          if (activeConvId === subConv.id) {
-            activeConvId = parentId;
-            renderMessages();
-          }
-          saveConversations();
-          renderHistory();
-          return;
-        }
-      }
-
-      renderHistory();
-      if (activeConvId === subConv.id) { renderMessages(); scrollToBottom({ force: true }); }
+      updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
     });
 
     const unsubError = window.electronAPI.cli.onError(({ id, error }) => {
       if (id !== streamId) return;
       if (!cleanupSubagentRun()) return;
-      aiMsg.content = fullOutput || `오류: ${error}`;
-      aiMsg.role = 'error';
-      subConv.subagentMeta.status = 'error';
+      const errorText = String(error || 'unknown error');
+      panel.result = fullOutput || `오류: ${errorText}`;
+      panel.error = errorText;
+      panel.status = 'error';
+      panel.finishedAt = Date.now();
+      panel.elapsedMs = panel.finishedAt - panel.startedAt;
+      panel.progressLines = subPreviewState.lines.slice(-80);
+      panelMsg.content = panel.result;
       saveConversations();
-      renderHistory();
-      if (activeConvId === subConv.id) { renderMessages(); scrollToBottom({ force: true }); }
+      updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
     });
 
     // 서브에이전트 실행 args 구성
@@ -5416,19 +5450,27 @@
 
       if (!runResult?.success) {
         cleanupSubagentRun();
-        aiMsg.content = `서브에이전트 실행 실패: ${runResult?.error || 'unknown error'}`;
-        aiMsg.role = 'error';
-        subConv.subagentMeta.status = 'error';
+        const errorText = runResult?.error || 'unknown error';
+        panel.result = `서브에이전트 실행 실패: ${errorText}`;
+        panel.error = errorText;
+        panel.status = 'error';
+        panel.finishedAt = Date.now();
+        panel.elapsedMs = panel.finishedAt - panel.startedAt;
+        panelMsg.content = panel.result;
         saveConversations();
-        renderHistory();
+        updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
       }
     } catch (err) {
       cleanupSubagentRun();
-      aiMsg.content = `서브에이전트 실행 오류: ${err?.message || String(err)}`;
-      aiMsg.role = 'error';
-      subConv.subagentMeta.status = 'error';
+      const errorText = err?.message || String(err);
+      panel.result = `서브에이전트 실행 오류: ${errorText}`;
+      panel.error = errorText;
+      panel.status = 'error';
+      panel.finishedAt = Date.now();
+      panel.elapsedMs = panel.finishedAt - panel.startedAt;
+      panelMsg.content = panel.result;
       saveConversations();
-      renderHistory();
+      updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
     }
   }
 
@@ -5503,7 +5545,7 @@
             description: taskSummary || `Codex가 위임한 작업 #${agentNum}`,
             developer_instructions: '',
           };
-          spawnSubagent(fakeAgent, prompt, { autoClose: subagentAutoClose });
+          spawnSubagent(fakeAgent, prompt, { parentConvId: convId });
         }
       } catch { /* not JSON */ }
     }
@@ -5581,7 +5623,7 @@ ${userPrompt}
             const agentName = String(t.agent || '').trim();
             const task = String(t.task || '').trim();
             if (!agentName || !task) return Promise.resolve();
-            return spawnSubagentByName(agentName, task, { autoClose: true });
+            return spawnSubagentByName(agentName, task);
           });
 
           await Promise.all(spawnPromises);
@@ -5694,12 +5736,24 @@ ${userPrompt}
     return `긴 입력 미리보기 · ${countTextLines(value)}줄 · ${formatCompactCharCount(value.length)}`;
   }
 
+  function getSubagentPanelMessages(conv) {
+    if (!conv || !Array.isArray(conv.messages)) return [];
+    return conv.messages.filter(msg => msg?.subagentPanel);
+  }
+
+  function getConversationMainMessages(conv) {
+    if (!conv || !Array.isArray(conv.messages)) return [];
+    return conv.messages.filter(msg => !msg?.subagentPanel);
+  }
+
   // === 메시지 렌더링 ===
   function renderMessages() {
     const conv = getActiveConversation();
+    const mainMessages = getConversationMainMessages(conv);
     if (!conv || conv.messages.length === 0) {
       $welcome.style.display = '';
       $messages.querySelectorAll('.message').forEach(el => el.remove());
+      renderSubagentRail(null);
       return;
     }
     $welcome.style.display = 'none';
@@ -5709,7 +5763,7 @@ ${userPrompt}
 
     // DocumentFragment로 일괄 삽입 → reflow 1회만 발생
     const frag = document.createDocumentFragment();
-    for (const msg of conv.messages) {
+    for (const msg of mainMessages) {
       try {
         const el = appendMessageDOM(msg, frag);
         if (convStreams.has(activeConvId)) {
@@ -5724,18 +5778,23 @@ ${userPrompt}
       }
     }
     $messages.appendChild(frag);
+    renderSubagentRail(conv);
     scrollToBottom({ force: true });
   }
 
   function appendMessageDOM(msg, targetParent) {
     const profile = PROFILES.find(p => p.id === msg.profileId) || PROFILES[0];
+    const subagentPanel = msg.subagentPanel ? normalizeSubagentPanel(msg.subagentPanel) : null;
+    if (subagentPanel) msg.subagentPanel = subagentPanel;
     const el = document.createElement('div');
-    el.className = `message ${msg.role}`;
+    el.className = `message ${msg.role}${subagentPanel ? ' subagent-panel-message' : ''}`;
     el.dataset.msgId = msg.id;
 
-    const avatarColor = msg.role === 'user' ? 'var(--accent)' : profile.color;
-    const avatarText = msg.role === 'user' ? 'U' : profile.icon;
-    const name = msg.role === 'user' ? 'You' : profile.name;
+    const avatarColor = msg.role === 'user'
+      ? 'var(--accent)'
+      : (subagentPanel ? 'linear-gradient(135deg, #10a37f, #7dd3fc)' : profile.color);
+    const avatarText = msg.role === 'user' ? 'U' : (subagentPanel ? 'A' : profile.icon);
+    const name = msg.role === 'user' ? 'You' : (subagentPanel ? subagentPanel.agentName : profile.name);
     const time = new Date(msg.timestamp).toLocaleTimeString('ko-KR', { hour: '2-digit', minute: '2-digit' });
 
     let bodyContent;
@@ -7105,6 +7164,41 @@ ${userPrompt}
     return parts.join('\n').trim();
   }
 
+  function extractJsonErrorMessage(...sources) {
+    const candidates = [];
+
+    const collect = (value) => {
+      if (value == null) return;
+      if (typeof value === 'string') {
+        const text = value.trim();
+        if (text && text !== '[object Object]') candidates.push(text);
+        return;
+      }
+      if (typeof value !== 'object') return;
+
+      for (const key of ['message', 'text', 'reason', 'detail', 'details', 'summary']) {
+        collect(value[key]);
+      }
+      collect(value.error);
+      collect(value.cause);
+    };
+
+    for (const source of sources) collect(source);
+
+    for (const candidate of candidates) {
+      const normalized = normalizeDetailLine(candidate);
+      if (normalized) return normalized;
+    }
+    return '';
+  }
+
+  function isProcessItemNoiseLine(line) {
+    const cleaned = normalizeDetailLine(String(line || ''));
+    if (!cleaned) return true;
+    return /^(?:작업\s*진행:\s*)?아이템:\s*error$/i.test(cleaned)
+      || /^이벤트:\s*error$/i.test(cleaned);
+  }
+
   function appendAssistantTextFromJsonObject(obj, target) {
     if (!obj || typeof obj !== 'object') return;
     const contentText = extractMessageTextFromJsonContent(obj.content);
@@ -7297,6 +7391,11 @@ ${userPrompt}
           }
           continue;
         }
+        if (eventType === 'error') {
+          const message = extractJsonErrorMessage(payload, obj);
+          if (message) appendUniqueLine(processLines, `error: ${message}`);
+          continue;
+        }
         if (eventType && eventType !== 'user_message') {
           appendUniqueLine(processLines, `event: ${eventType}`);
         }
@@ -7306,6 +7405,11 @@ ${userPrompt}
       if (type === 'response_item') {
         const payload = obj.payload || {};
         const itemType = String(payload.type || '').toLowerCase();
+        if (itemType === 'error') {
+          const message = extractJsonErrorMessage(payload, obj);
+          if (message) appendUniqueLine(processLines, `error: ${message}`);
+          continue;
+        }
         if (itemType === 'message') {
           const role = String(payload.role || '').toLowerCase();
           const phase = String(payload.phase || '').toLowerCase();
@@ -7348,6 +7452,11 @@ ${userPrompt}
       if (type === 'item.completed' || type === 'item.started' || type === 'item.delta' || type === 'item.updated') {
         const item = obj.item || obj.payload?.item || obj.payload || {};
         const itemType = String(item.type || obj.item_type || '').toLowerCase();
+        if (itemType === 'error') {
+          const message = extractJsonErrorMessage(item, obj);
+          if (message) appendUniqueLine(processLines, `error: ${message}`);
+          continue;
+        }
         const itemText = extractItemText(item);
         const deltaText = String(obj.delta?.text || obj.text || '').trim();
         const mergedText = [itemText, deltaText].filter(Boolean).join('\n').trim();
@@ -7810,6 +7919,7 @@ ${userPrompt}
       .replace(/\s+/g, ' ')
       .trim();
     if (!cleaned) return '';
+    if (isProcessItemNoiseLine(cleaned)) return '';
     return cleaned.slice(0, 480);
   }
 
@@ -7917,7 +8027,19 @@ ${userPrompt}
       // 세션/턴 메타 JSON 이벤트는 과정 탭에서 제외 (approval_policy 등이 표시되는 것 방지)
       if (_isSessionMetaJsonLine(line)) continue;
 
-      const normalized = normalizeProcessLine(line);
+      let normalizedSource = line;
+      if (line.startsWith('{') && line.endsWith('}')) {
+        try {
+          const obj = JSON.parse(line);
+          const jsonDetail = toProcessJsonDetailLine(obj, 420);
+          if (!jsonDetail) continue;
+          normalizedSource = jsonDetail;
+        } catch {
+          normalizedSource = line;
+        }
+      }
+
+      const normalized = normalizeProcessLine(normalizedSource);
       if (!normalized) continue;
       entries.push({
         raw: line,
@@ -7939,6 +8061,7 @@ ${userPrompt}
         const obj = JSON.parse(raw);
         const jsonDetail = toProcessJsonDetailLine(obj, 420);
         if (jsonDetail) return normalizeDetailLine(jsonDetail);
+        return '';
       } catch {
         // JSON 파싱 실패 시 일반 텍스트 경로로 계속 처리
       }
@@ -8203,8 +8326,8 @@ ${userPrompt}
       return message ? `실패: ${compactPreviewText(message, maxLen)}` : '실패';
     }
     if (type === 'error') {
-      const message = String(obj?.message || obj?.error?.message || '').trim();
-      return message ? `오류: ${compactPreviewText(message, maxLen)}` : '오류';
+      const message = extractJsonErrorMessage(obj);
+      return message ? `오류: ${compactPreviewText(message, maxLen)}` : '';
     }
 
     if (type === 'event_msg') {
@@ -8232,12 +8355,20 @@ ${userPrompt}
           return `limit remaining: 5h ${pRemain}, weekly ${sRemain}`;
         }
       }
+      if (eventType === 'error') {
+        const message = extractJsonErrorMessage(payload, obj);
+        return message ? `오류: ${compactPreviewText(message, maxLen)}` : '';
+      }
       if (eventType) return `이벤트: ${eventType}`;
     }
 
     if (type === 'response_item') {
       const payload = obj.payload || {};
       const itemType = String(payload.type || '').toLowerCase();
+      if (itemType === 'error') {
+        const message = extractJsonErrorMessage(payload, obj);
+        return message ? `오류: ${compactPreviewText(message, maxLen)}` : '';
+      }
       if (itemType === 'function_call' || itemType === 'custom_tool_call') {
         const name = String(payload.name || 'tool').trim();
         const args = toProcessArgsDetailText(
@@ -8285,6 +8416,10 @@ ${userPrompt}
       const statusLabel = toItemEventStatusLabel(type);
       const statusSuffix = statusLabel ? ` (${statusLabel})` : '';
 
+      if (itemType === 'error') {
+        const message = extractJsonErrorMessage(item, obj);
+        return message ? `오류${statusSuffix}: ${compactPreviewText(message, maxLen)}` : '';
+      }
       if (itemType === 'agent_message' || itemType === 'assistant_message' || itemType === 'message') {
         return itemText ? `응답 업데이트${statusSuffix}: ${compactPreviewText(itemText, maxLen)}` : `응답 업데이트${statusSuffix}`;
       }
@@ -8326,6 +8461,7 @@ ${userPrompt}
         const obj = JSON.parse(raw);
         const detail = toProcessJsonDetailLine(obj, 320);
         if (detail) return detail;
+        return '';
       } catch {
         // JSON 미완성 라인은 일반 텍스트 경로로 처리
       }
@@ -9809,7 +9945,174 @@ ${userPrompt}
     return { currentTab };
   }
 
+  function formatSubagentElapsed(ms) {
+    const sec = Math.max(0, Math.floor((Number(ms) || 0) / 1000));
+    if (sec < 60) return `${sec}초`;
+    const min = Math.floor(sec / 60);
+    const rest = sec % 60;
+    if (min < 60) return `${min}분 ${rest}초`;
+    const hour = Math.floor(min / 60);
+    return `${hour}시간 ${min % 60}분`;
+  }
+
+  function getSubagentStatusMeta(status) {
+    const normalized = String(status || '').toLowerCase();
+    if (normalized === 'completed') return { label: '완료', className: 'completed' };
+    if (normalized === 'error') return { label: '오류', className: 'error' };
+    if (normalized === 'running') return { label: '실행 중', className: 'running' };
+    return { label: '대기', className: 'pending' };
+  }
+
+  function renderSubagentPanel(msg) {
+    const panel = normalizeSubagentPanel(msg?.subagentPanel);
+    if (!panel) return '';
+    const status = getSubagentStatusMeta(panel.status);
+    const elapsedMs = panel.status === 'running'
+      ? Date.now() - panel.startedAt
+      : (panel.elapsedMs || (panel.finishedAt && panel.startedAt ? panel.finishedAt - panel.startedAt : 0));
+    const progressLines = Array.isArray(panel.progressLines) ? panel.progressLines.slice(-16) : [];
+    const resultText = String(panel.result || msg?.content || '').trim();
+    const resultHtml = resultText
+      ? renderMarkdown(resultText)
+      : `<div class="subagent-empty-result">${panel.status === 'running' ? '결과를 기다리는 중입니다.' : '표시할 결과가 없습니다.'}</div>`;
+    const progressHtml = progressLines.length > 0
+      ? progressLines.map(line => `<li>${escapeHtml(line)}</li>`).join('')
+      : '<li class="subagent-muted-line">진행 로그를 수신 중입니다.</li>';
+
+    return `<section class="subagent-inline-panel subagent-${status.className}" data-subagent-status="${status.className}">
+      <div class="subagent-panel-header">
+        <div class="subagent-panel-heading">
+          <span class="subagent-panel-kicker">서브에이전트</span>
+          <strong class="subagent-panel-name">${escapeHtml(panel.agentName || '서브에이전트')}</strong>
+        </div>
+        <div class="subagent-panel-meta">
+          <span class="subagent-status-pill">${escapeHtml(status.label)}</span>
+          <span class="subagent-elapsed">${escapeHtml(formatSubagentElapsed(elapsedMs))}</span>
+        </div>
+      </div>
+      ${panel.description ? `<div class="subagent-panel-description">${escapeHtml(panel.description)}</div>` : ''}
+      <div class="subagent-split-layout">
+        <div class="subagent-pane subagent-pane-progress">
+          <div class="subagent-pane-title">작업 지시</div>
+          <div class="subagent-prompt-preview">${escapeHtml(panel.prompt || '(프롬프트 없음)')}</div>
+          <div class="subagent-pane-title subagent-progress-title">진행 로그</div>
+          <ol class="subagent-progress-lines">${progressHtml}</ol>
+        </div>
+        <div class="subagent-pane subagent-pane-result">
+          <div class="subagent-pane-title">결과</div>
+          <div class="subagent-result-body">${resultHtml}</div>
+          ${panel.error ? `<div class="subagent-error-text">${escapeHtml(panel.error)}</div>` : ''}
+        </div>
+      </div>
+    </section>`;
+  }
+
+  function getSubagentRailExcerpt(panel) {
+    const progressText = Array.isArray(panel.progressLines)
+      ? panel.progressLines.slice(-10).join('\n')
+      : '';
+    const source = String(panel.result || progressText || panel.prompt || '').trim();
+    if (!source) return '진행 데이터를 기다리는 중입니다.';
+    const lines = source
+      .replace(/\r\n/g, '\n')
+      .split('\n')
+      .map(line => line.trimEnd())
+      .filter(Boolean)
+      .slice(0, 14);
+    const preview = lines.join('\n');
+    return preview.length > 1800 ? `${preview.slice(0, 1800).trimEnd()}\n...` : preview;
+  }
+
+  function getSubagentRailToolLabel(panel) {
+    const lines = Array.isArray(panel.progressLines) ? panel.progressLines : [];
+    const source = lines.join('\n');
+    if (/\bpowershell\b|\bpwsh\b/i.test(source)) return 'PowerShell';
+    if (/\bcmd\b/i.test(source)) return 'cmd';
+    if (/\bbash\b|\bshell\b|\bcommand\b|명령/i.test(source)) return 'Bash';
+    if (/\bapply_patch\b|patch|수정|변경/i.test(source)) return 'Patch';
+    return panel.status === 'running' ? 'Codex' : 'Result';
+  }
+
+  function renderSubagentRailCard(msg) {
+    const panel = normalizeSubagentPanel(msg?.subagentPanel);
+    if (!panel) return '';
+    msg.subagentPanel = panel;
+    const status = getSubagentStatusMeta(panel.status);
+    const elapsedMs = panel.status === 'running'
+      ? Date.now() - panel.startedAt
+      : (panel.elapsedMs || (panel.finishedAt && panel.startedAt ? panel.finishedAt - panel.startedAt : 0));
+    const outputTitle = panel.result
+      ? (panel.status === 'completed' ? '최종 결과' : '진행 결과')
+      : '진행 결과';
+    const excerpt = getSubagentRailExcerpt(panel);
+    const toolLabel = getSubagentRailToolLabel(panel);
+
+    return `<article class="subagent-rail-card subagent-${status.className}" data-subagent-msg-id="${escapeHtml(msg.id || '')}">
+      <header class="subagent-rail-header">
+        <span class="subagent-rail-dot" aria-hidden="true"></span>
+        <div class="subagent-rail-title-wrap">
+          <div class="subagent-rail-title">${escapeHtml(panel.agentName || '서브에이전트')}</div>
+          ${panel.description ? `<div class="subagent-rail-subtitle">${escapeHtml(panel.description)}</div>` : ''}
+        </div>
+        <span class="subagent-rail-status">${escapeHtml(status.label)}</span>
+      </header>
+      <div class="subagent-rail-tool">
+        <span class="subagent-rail-tool-mark" aria-hidden="true"></span>
+        <span>${escapeHtml(toolLabel)}</span>
+        <span class="subagent-rail-elapsed">${escapeHtml(formatSubagentElapsed(elapsedMs))}</span>
+      </div>
+      <div class="subagent-rail-output">
+        <div class="subagent-rail-output-title">${escapeHtml(outputTitle)}</div>
+        <pre>${escapeHtml(excerpt)}</pre>
+      </div>
+      ${panel.error ? `<div class="subagent-rail-error">${escapeHtml(panel.error)}</div>` : ''}
+    </article>`;
+  }
+
+  function renderSubagentRail(conv) {
+    if (!$subagentRail || !$conversationSplit) return;
+    const panels = getSubagentPanelMessages(conv)
+      .map(msg => {
+        msg.subagentPanel = normalizeSubagentPanel(msg.subagentPanel);
+        return msg;
+      })
+      .filter(msg => msg.subagentPanel);
+
+    const hasPanels = panels.length > 0;
+    $conversationSplit.classList.toggle('has-subagents', hasPanels);
+    $subagentRail.classList.toggle('hidden', !hasPanels);
+    if (!hasPanels) {
+      $subagentRail.innerHTML = '';
+      return;
+    }
+
+    const statusRank = { running: 0, pending: 1, error: 2, completed: 3 };
+    const orderedPanels = panels.slice().sort((a, b) => {
+      const rankA = statusRank[a.subagentPanel.status] ?? 9;
+      const rankB = statusRank[b.subagentPanel.status] ?? 9;
+      if (rankA !== rankB) return rankA - rankB;
+      return Number(a.timestamp || 0) - Number(b.timestamp || 0);
+    });
+
+    $subagentRail.innerHTML = `<div class="subagent-rail-list">
+      ${orderedPanels.map(renderSubagentRailCard).join('')}
+    </div>`;
+  }
+
+  function updateSubagentPanelDom(panelMsg, parentConvId, options = {}) {
+    if (!panelMsg?.subagentPanel) return;
+    panelMsg.subagentPanel = normalizeSubagentPanel(panelMsg.subagentPanel);
+    if (activeConvId !== parentConvId) return;
+    renderSubagentRail(_convMap.get(parentConvId));
+    if (options.forceScroll) scrollToBottom({ force: true });
+    else scrollToBottom();
+  }
+
   function renderAIBody(msg, opts = {}) {
+    if (msg?.subagentPanel) {
+      return renderSubagentPanel(msg);
+    }
+
     // 서브에이전트 스트리밍 중이면 작업 표시기 + thinking-log 반환
     if (msg._subagentStreaming) {
       return `<div class="thinking-indicator">
@@ -11079,8 +11382,15 @@ ${userPrompt}
 
     const overlay = document.createElement('div');
     overlay.className = 'commit-modal-overlay';
+    const closeCommitModal = () => {
+      document.removeEventListener('keydown', escHandler);
+      overlay.remove();
+    };
+    const escHandler = (e) => {
+      if (e.key === 'Escape') closeCommitModal();
+    };
     overlay.addEventListener('click', (e) => {
-      if (e.target === overlay) overlay.remove();
+      if (e.target === overlay) closeCommitModal();
     });
 
     const modal = document.createElement('div');
@@ -11109,12 +11419,7 @@ ${userPrompt}
     const btnCancel = modal.querySelector('.commit-btn-cancel');
     const btnConfirm = modal.querySelector('.commit-btn-confirm');
 
-    btnCancel.addEventListener('click', () => overlay.remove());
-
-    // Escape 키로 닫기
-    const escHandler = (e) => {
-      if (e.key === 'Escape') { overlay.remove(); document.removeEventListener('keydown', escHandler); }
-    };
+    btnCancel.addEventListener('click', closeCommitModal);
     document.addEventListener('keydown', escHandler);
 
     // 변경 사항 로드
@@ -11140,22 +11445,64 @@ ${userPrompt}
         return s;
       };
 
-      filesDiv.innerHTML = status.files.map(f =>
-        `<div class="file-entry">
-          <span class="file-status ${fileStatusClass(f.status)}">${fileStatusLabel(f.status)}</span>
-          <span class="file-name">${f.file}</span>
-        </div>`
-      ).join('');
+      const statusFiles = status.files;
+      const getSelectedCommitFiles = () => Array.from(filesDiv.querySelectorAll('.commit-file-checkbox:checked'))
+        .map(input => statusFiles[Number(input.value)])
+        .filter(Boolean)
+        .map(file => ({
+          file: file.file,
+          paths: Array.isArray(file.paths) && file.paths.length > 0 ? file.paths : [file.file],
+        }));
+      const updateCommitButtons = () => {
+        const hasMessage = Boolean(msgInput.value.trim());
+        const hasFiles = getSelectedCommitFiles().length > 0;
+        btnConfirm.disabled = !hasMessage || !hasFiles;
+        if (btnGenerate) btnGenerate.disabled = !hasFiles;
+      };
+
+      filesDiv.innerHTML = `<div class="commit-file-toolbar">
+          <span>${statusFiles.length}개 변경 파일</span>
+          <button class="commit-select-all" type="button">전체 선택</button>
+          <button class="commit-select-none" type="button">선택 해제</button>
+        </div>
+        ${statusFiles.map((f, idx) =>
+          `<label class="file-entry">
+            <input class="commit-file-checkbox" type="checkbox" value="${idx}" checked>
+            <span class="file-status ${escapeHtml(fileStatusClass(f.status))}">${escapeHtml(fileStatusLabel(f.status))}</span>
+            <span class="file-name">${escapeHtml(f.file)}</span>
+          </label>`
+        ).join('')}`;
+
+      filesDiv.addEventListener('click', (e) => {
+        if (e.target.closest('.commit-select-all')) {
+          filesDiv.querySelectorAll('.commit-file-checkbox').forEach(input => { input.checked = true; });
+          updateCommitButtons();
+          return;
+        }
+        if (e.target.closest('.commit-select-none')) {
+          filesDiv.querySelectorAll('.commit-file-checkbox').forEach(input => { input.checked = false; });
+          updateCommitButtons();
+        }
+      });
+      filesDiv.addEventListener('change', (e) => {
+        if (e.target.closest('.commit-file-checkbox')) updateCommitButtons();
+      });
 
       // AI 커밋 메시지 생성 버튼
       const btnGenerate = modal.querySelector('.commit-btn-generate');
       if (btnGenerate) {
         btnGenerate.addEventListener('click', async () => {
+          const selectedFiles = getSelectedCommitFiles();
+          if (selectedFiles.length === 0) {
+            msgInput.placeholder = '커밋 메시지를 생성할 파일을 선택하세요.';
+            updateCommitButtons();
+            return;
+          }
           btnGenerate.disabled = true;
           btnGenerate.textContent = '생성 중...';
           msgInput.placeholder = 'AI가 커밋 메시지를 생성하고 있습니다...';
           try {
-            const result = await window.electronAPI.repo.generateCommitMessage({ cwd: currentCwd });
+            const result = await window.electronAPI.repo.generateCommitMessage({ cwd: currentCwd, files: selectedFiles });
             if (result?.success && result.message) {
               msgInput.value = result.message;
               msgInput.dispatchEvent(new Event('input'));
@@ -11168,6 +11515,7 @@ ${userPrompt}
           } finally {
             btnGenerate.disabled = false;
             btnGenerate.innerHTML = `<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></svg> AI 생성`;
+            updateCommitButtons();
           }
         });
 
@@ -11189,20 +11537,26 @@ ${userPrompt}
 
       // 메시지 비어있으면 버튼 비활성
       msgInput.addEventListener('input', () => {
-        btnConfirm.disabled = !msgInput.value.trim();
+        updateCommitButtons();
       });
-      btnConfirm.disabled = true;
+      updateCommitButtons();
 
       // 커밋 실행
       btnConfirm.addEventListener('click', async () => {
         const msg = msgInput.value.trim();
         if (!msg) return;
+        const selectedFiles = getSelectedCommitFiles();
+        if (selectedFiles.length === 0) {
+          updateCommitButtons();
+          return;
+        }
         btnConfirm.disabled = true;
         btnConfirm.textContent = '커밋 중...';
         msgInput.disabled = true;
+        filesDiv.querySelectorAll('input, button').forEach(el => { el.disabled = true; });
 
         try {
-          const result = await window.electronAPI.repo.commit({ cwd: currentCwd, message: msg });
+          const result = await window.electronAPI.repo.commit({ cwd: currentCwd, message: msg, files: selectedFiles });
           if (result?.success) {
             // 성공 표시
             const resultDiv = document.createElement('div');
@@ -11214,7 +11568,7 @@ ${userPrompt}
             btnConfirm.style.display = 'none';
             btnCancel.textContent = '닫기';
             // 2초 후 자동 닫기
-            setTimeout(() => overlay.remove(), 2000);
+            setTimeout(closeCommitModal, 2000);
           } else {
             const resultDiv = document.createElement('div');
             resultDiv.className = 'commit-result error';
@@ -11223,6 +11577,8 @@ ${userPrompt}
             btnConfirm.disabled = false;
             btnConfirm.textContent = '커밋';
             msgInput.disabled = false;
+            filesDiv.querySelectorAll('input, button').forEach(el => { el.disabled = false; });
+            updateCommitButtons();
           }
         } catch (err) {
           const resultDiv = document.createElement('div');
@@ -11232,11 +11588,13 @@ ${userPrompt}
           btnConfirm.disabled = false;
           btnConfirm.textContent = '커밋';
           msgInput.disabled = false;
+          filesDiv.querySelectorAll('input, button').forEach(el => { el.disabled = false; });
+          updateCommitButtons();
         }
       });
 
     } catch (err) {
-      filesDiv.innerHTML = `<div class="commit-empty">오류: ${err.message || '상태를 가져올 수 없습니다'}</div>`;
+      filesDiv.innerHTML = `<div class="commit-empty">오류: ${escapeHtml(err.message || '상태를 가져올 수 없습니다')}</div>`;
     }
   }
 
@@ -11308,7 +11666,8 @@ ${userPrompt}
     $btnSidebarToggle.addEventListener('click', (e) => {
       e.preventDefault();
       e.stopPropagation();
-      setSidebarCollapsed(!sidebarCollapsed);
+      if (sidebarCollapsed) openSidebarTemporarily();
+      else setSidebarCollapsed(true);
     });
   }
 
@@ -11478,7 +11837,8 @@ ${userPrompt}
     }
     if (e.ctrlKey && e.key.toLowerCase() === 'b') {
       e.preventDefault();
-      setSidebarCollapsed(!sidebarCollapsed);
+      if (sidebarCollapsed) openSidebarTemporarily();
+      else setSidebarCollapsed(true);
     }
     if (e.ctrlKey && e.key === 'l') {
       e.preventDefault();

@@ -13,6 +13,7 @@ let resolvedCliPaths = {}; // command name → resolved absolute path 캐시
 const MAX_FILE_IMPORT_BYTES = 180 * 1024;
 const MAX_IMAGE_IMPORT_BYTES = 20 * 1024 * 1024; // 이미지는 20MB까지
 const MAX_PDF_IMPORT_BYTES = 10 * 1024 * 1024; // PDF는 10MB까지
+const COMMIT_MESSAGE_TIMEOUT_MS = 45000;
 const CODEX_MODEL_CATALOG_TIMEOUT_MS = 8000;
 const CODEX_COMMAND_CATALOG_TIMEOUT_MS = 8000;
 const FALLBACK_CODEX_MODELS = [
@@ -526,6 +527,103 @@ function runGitCommandAsync(args, cwd) {
       });
     }
   });
+}
+
+function parseGitStatusPorcelainZ(output) {
+  const entries = String(output || '').split('\0');
+  const files = [];
+  for (let i = 0; i < entries.length; i++) {
+    const entry = entries[i];
+    if (!entry || entry.length < 4) continue;
+    const statusRaw = entry.slice(0, 2);
+    const status = statusRaw.trim() || statusRaw;
+    const firstPath = entry.slice(3);
+    if (!firstPath) continue;
+
+    if (statusRaw.includes('R') || statusRaw.includes('C')) {
+      const oldPath = entries[++i] || '';
+      const displayPath = oldPath ? `${oldPath} -> ${firstPath}` : firstPath;
+      const paths = [oldPath, firstPath].filter(Boolean);
+      files.push({ status, file: displayPath, paths });
+      continue;
+    }
+
+    files.push({ status, file: firstPath, paths: [firstPath] });
+  }
+  return files;
+}
+
+function normalizeGitPathspec(inputPath, repoRoot) {
+  const raw = String(inputPath || '').trim();
+  if (!raw) return '';
+
+  let candidate = raw.replace(/^['"]|['"]$/g, '').replace(/\\/g, '/');
+  if (!candidate) return '';
+
+  if (candidate.includes(' -> ')) {
+    return '';
+  }
+
+  if (path.isAbsolute(candidate)) {
+    const relative = path.relative(repoRoot, candidate);
+    if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) return '';
+    candidate = relative.replace(/\\/g, '/');
+  }
+
+  candidate = candidate.replace(/^\.\/+/, '');
+  if (!candidate || candidate === '.' || candidate.startsWith('../') || candidate.includes('/../')) return '';
+
+  const resolved = path.resolve(repoRoot, candidate);
+  const relativeToRoot = path.relative(repoRoot, resolved);
+  if (!relativeToRoot || relativeToRoot.startsWith('..') || path.isAbsolute(relativeToRoot)) return '';
+  return relativeToRoot.replace(/\\/g, '/');
+}
+
+function normalizeCommitFileList(entries, repoRoot) {
+  const source = Array.isArray(entries) ? entries : [];
+  const seen = new Set();
+  const normalized = [];
+
+  const push = (value) => {
+    const rel = normalizeGitPathspec(value, repoRoot);
+    if (!rel || seen.has(rel)) return;
+    seen.add(rel);
+    normalized.push(rel);
+  };
+
+  for (const entry of source) {
+    if (entry && typeof entry === 'object') {
+      if (Array.isArray(entry.paths)) {
+        for (const item of entry.paths) push(item);
+        continue;
+      }
+      push(entry.file);
+      continue;
+    }
+    const value = String(entry || '');
+    if (value.includes(' -> ')) {
+      value.split(' -> ').forEach(push);
+    } else {
+      push(value);
+    }
+  }
+
+  return normalized;
+}
+
+async function listStagedFiles(repoRoot) {
+  const result = await runGitCommandAsync(['diff', '--cached', '--name-only', '-z'], repoRoot);
+  if (!result.ok) return { ok: false, files: [], error: result.stderr || result.error || 'git diff --cached failed' };
+  return {
+    ok: true,
+    files: result.stdout.split('\0').map(item => item.replace(/\\/g, '/')).filter(Boolean),
+    error: '',
+  };
+}
+
+function findPathsOutsideSelection(paths, selectedPaths) {
+  const selected = new Set(selectedPaths.map(item => item.replace(/\\/g, '/')));
+  return paths.filter(item => !selected.has(String(item || '').replace(/\\/g, '/')));
 }
 
 function normalizeRepoFilePath(inputPath, repoRoot, fallbackCwd) {
@@ -1971,16 +2069,18 @@ ipcMain.handle('repo:generateCommitMessage', async (event, arg) => {
     const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
     if (!rootResult.ok) return { success: false, error: 'git repository not found' };
     const repoRoot = rootResult.stdout.trim();
+    const selectedPaths = normalizeCommitFileList(arg?.files, repoRoot);
+    const pathspecArgs = selectedPaths.length > 0 ? ['--', ...selectedPaths] : [];
 
     // diff 수집 (staged + unstaged + untracked)
     const [stagedDiff, unstagedDiff, untrackedFiles] = await Promise.all([
-      runGitCommandAsync(['diff', '--cached', '--no-color', '--stat'], repoRoot),
-      runGitCommandAsync(['diff', '--no-color', '--stat'], repoRoot),
-      runGitCommandAsync(['ls-files', '--others', '--exclude-standard'], repoRoot),
+      runGitCommandAsync(['diff', '--cached', '--no-color', '--stat', ...pathspecArgs], repoRoot),
+      runGitCommandAsync(['diff', '--no-color', '--stat', ...pathspecArgs], repoRoot),
+      runGitCommandAsync(['ls-files', '--others', '--exclude-standard', ...pathspecArgs], repoRoot),
     ]);
     const [stagedDetail, unstagedDetail] = await Promise.all([
-      runGitCommandAsync(['diff', '--cached', '--no-color'], repoRoot),
-      runGitCommandAsync(['diff', '--no-color'], repoRoot),
+      runGitCommandAsync(['diff', '--cached', '--no-color', ...pathspecArgs], repoRoot),
+      runGitCommandAsync(['diff', '--no-color', ...pathspecArgs], repoRoot),
     ]);
 
     let diffSummary = '';
@@ -2049,9 +2149,20 @@ ${detailDiff}`;
         stdio: ['pipe', 'pipe', 'pipe'],
       };
 
-      const child = spawn(spawnCmd, spawnArgs, spawnOptions);
+      let child = null;
       let stdout = '';
       let stderr = '';
+      let settled = false;
+      let timer = null;
+
+      const finish = (result) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        resolve(result);
+      };
+
+      child = spawn(spawnCmd, spawnArgs, spawnOptions);
 
       child.stdout?.on('data', (d) => { stdout += d.toString('utf8'); });
       child.stderr?.on('data', (d) => { stderr += d.toString('utf8'); });
@@ -2070,15 +2181,20 @@ ${detailDiff}`;
         }
         message = message.trim();
         if (!message) {
-          resolve({ success: false, error: stderr.trim() || 'no message generated' });
+          finish({ success: false, error: stderr.trim() || 'no message generated' });
         } else {
-          resolve({ success: true, message });
+          finish({ success: true, message });
         }
       });
 
       child.on('error', (err) => {
-        resolve({ success: false, error: err.message });
+        finish({ success: false, error: err.message });
       });
+
+      timer = setTimeout(() => {
+        try { child?.kill(); } catch { /* ignore */ }
+        finish({ success: false, error: 'commit message generation timed out' });
+      }, COMMIT_MESSAGE_TIMEOUT_MS);
     });
   } catch (err) {
     return { success: false, error: err.message };
@@ -2094,16 +2210,10 @@ ipcMain.handle('repo:getStatus', async (event, arg) => {
     const repoRoot = rootResult.stdout.trim();
 
     // 변경 파일 목록
-    const statusResult = await runGitCommandAsync(['status', '--porcelain'], repoRoot);
+    const statusResult = await runGitCommandAsync(['status', '--porcelain=v1', '-z'], repoRoot);
     if (!statusResult.ok) return { success: false, error: statusResult.stderr || 'git status failed' };
 
-    const files = [];
-    for (const line of statusResult.stdout.split(/\r?\n/)) {
-      if (!line || line.length < 4) continue;
-      const status = line.slice(0, 2).trim();
-      const filePath = line.slice(3).trim();
-      if (filePath) files.push({ status, file: filePath });
-    }
+    const files = parseGitStatusPorcelainZ(statusResult.stdout);
 
     // 최근 커밋 메시지 (스타일 참고용)
     const logResult = await runGitCommandAsync(['log', '--oneline', '-5'], repoRoot);
@@ -2137,15 +2247,36 @@ ipcMain.handle('repo:commit', async (event, arg) => {
     const rootResult = await runGitCommandAsync(['rev-parse', '--show-toplevel'], cwd);
     if (!rootResult.ok) return { success: false, error: 'git repository not found' };
     const repoRoot = rootResult.stdout.trim();
+    const selectedPaths = normalizeCommitFileList(arg?.files, repoRoot);
+    if (selectedPaths.length === 0) {
+      return { success: false, error: '커밋할 파일을 선택하세요.' };
+    }
 
-    // 모든 변경 사항 stage
-    const addResult = await runGitCommandAsync(['add', '-A'], repoRoot);
+    const stagedBefore = await listStagedFiles(repoRoot);
+    if (!stagedBefore.ok) return { success: false, error: stagedBefore.error };
+    const stagedOutsideSelection = findPathsOutsideSelection(stagedBefore.files, selectedPaths);
+    if (stagedOutsideSelection.length > 0) {
+      return {
+        success: false,
+        error: `선택하지 않은 staged 파일이 있습니다: ${stagedOutsideSelection.slice(0, 5).join(', ')}`,
+      };
+    }
+
+    // 선택된 파일만 stage
+    const addResult = await runGitCommandAsync(['add', '-A', '--', ...selectedPaths], repoRoot);
     if (!addResult.ok) return { success: false, error: `git add failed: ${addResult.stderr}` };
 
     // staged 파일 확인
-    const stagedResult = await runGitCommandAsync(['diff', '--cached', '--name-only'], repoRoot);
-    if (!stagedResult.ok || !stagedResult.stdout.trim()) {
+    const stagedResult = await listStagedFiles(repoRoot);
+    if (!stagedResult.ok || stagedResult.files.length === 0) {
       return { success: false, error: '커밋할 변경 사항이 없습니다.' };
+    }
+    const stagedAfterOutsideSelection = findPathsOutsideSelection(stagedResult.files, selectedPaths);
+    if (stagedAfterOutsideSelection.length > 0) {
+      return {
+        success: false,
+        error: `선택하지 않은 파일이 staged 상태입니다: ${stagedAfterOutsideSelection.slice(0, 5).join(', ')}`,
+      };
     }
 
     // 커밋 실행
@@ -3410,13 +3541,69 @@ function getConversationsPath() {
   return path.join(app.getPath('userData'), 'conversations.json');
 }
 
+function getConversationsBackupPath() {
+  return `${getConversationsPath()}.bak`;
+}
+
+function parseConversationsJson(raw) {
+  const parsed = JSON.parse(raw);
+  return Array.isArray(parsed) ? parsed : [];
+}
+
+function loadConversationsFromDisk() {
+  const filePath = getConversationsPath();
+  if (!fs.existsSync(filePath)) return { data: [], recoveredFromBackup: false };
+
+  try {
+    return {
+      data: parseConversationsJson(fs.readFileSync(filePath, 'utf8')),
+      recoveredFromBackup: false,
+    };
+  } catch (primaryError) {
+    const backupPath = getConversationsBackupPath();
+    if (fs.existsSync(backupPath)) {
+      try {
+        return {
+          data: parseConversationsJson(fs.readFileSync(backupPath, 'utf8')),
+          recoveredFromBackup: true,
+          error: primaryError.message,
+        };
+      } catch {
+        // fall through to primary error
+      }
+    }
+    throw primaryError;
+  }
+}
+
+function writeJsonFileAtomic(filePath, data) {
+  const dir = path.dirname(filePath);
+  fs.mkdirSync(dir, { recursive: true });
+
+  const tmpPath = path.join(dir, `${path.basename(filePath)}.${process.pid}.${Date.now()}.tmp`);
+  const backupPath = `${filePath}.bak`;
+  fs.writeFileSync(tmpPath, JSON.stringify(data, null, 0), 'utf8');
+
+  if (fs.existsSync(filePath)) {
+    try {
+      fs.copyFileSync(filePath, backupPath);
+    } catch (err) {
+      console.warn('[store] backup copy failed:', err.message);
+    }
+  }
+
+  fs.renameSync(tmpPath, filePath);
+}
+
 ipcMain.handle('store:loadConversations', () => {
   try {
-    const filePath = getConversationsPath();
-    if (!fs.existsSync(filePath)) return { success: true, data: [] };
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return { success: true, data: Array.isArray(parsed) ? parsed : [] };
+    const loaded = loadConversationsFromDisk();
+    return {
+      success: true,
+      data: loaded.data,
+      recoveredFromBackup: Boolean(loaded.recoveredFromBackup),
+      error: loaded.error || '',
+    };
   } catch (err) {
     console.error('[store] loadConversations error:', err.message);
     return { success: false, data: [], error: err.message };
@@ -3426,7 +3613,7 @@ ipcMain.handle('store:loadConversations', () => {
 ipcMain.handle('store:saveConversations', (event, data) => {
   try {
     const filePath = getConversationsPath();
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 0), 'utf8');
+    writeJsonFileAtomic(filePath, data);
     return { success: true };
   } catch (err) {
     console.error('[store] saveConversations error:', err.message);
@@ -3438,7 +3625,7 @@ ipcMain.handle('store:saveConversations', (event, data) => {
 ipcMain.on('store:saveConversationsSync', (event, data) => {
   try {
     const filePath = getConversationsPath();
-    fs.writeFileSync(filePath, JSON.stringify(data, null, 0), 'utf8');
+    writeJsonFileAtomic(filePath, data);
     event.returnValue = { success: true };
   } catch (err) {
     console.error('[store] saveConversationsSync error:', err.message);
