@@ -52,10 +52,10 @@
 
   /* -- Layout ---------------------------- */
   --titlebar-h: 42px;
-  --sidebar-w: clamp(304px, 27vw, 396px);
+  --sidebar-w: clamp(264px, 22vw, 320px);
   --layout-gutter: clamp(24px, 4vw, 56px);
   --message-max: 860px;
-  --bubble-max-user: min(75%, 680px);
+  --bubble-max-user: min(72%, 660px);
   --bubble-max-ai: 100%;
 
   /* -- Typography ------------------------ */
@@ -63,9 +63,9 @@
   --mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', 'D2Coding', monospace;
 
   /* -- Shape & Motion -------------------- */
-  --radius: 12px;
+  --radius: 10px;
   --radius-sm: 8px;
-  --radius-xs: 5px;
+  --radius-xs: 6px;
   --shadow-sm: 0 1px 3px rgba(0,0,0,0.3);
   --shadow-md: 0 4px 20px rgba(0,0,0,0.4);
   --shadow-lg: 0 12px 40px rgba(0,0,0,0.55);
@@ -92,6 +92,8 @@ html, body {
   font-size: 13px;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'ss01', 'cv01', 'cv11';
+  letter-spacing: -0.01em;
 }
 
 body {
@@ -138,11 +140,11 @@ body::before, body::after { display: none; }
 }
 
 .title-text {
-  font-size: 11px;
-  font-weight: 700;
+  font-size: 12px;
+  font-weight: 600;
   color: var(--text-secondary);
-  letter-spacing: 2.5px;
-  text-transform: uppercase;
+  letter-spacing: -0.005em;
+  text-transform: none;
 }
 
 #titlebar-controls {
@@ -339,12 +341,13 @@ body.sidebar-resizing * {
 
 .sidebar-btn {
   width: 100%;
-  padding: 11px 14px;
+  padding: 10px 14px;
   border: none;
   border-radius: var(--radius-sm);
   font-family: var(--font);
-  font-size: 12.5px;
-  font-weight: 600;
+  font-size: 13px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
   cursor: pointer;
   display: flex;
   align-items: center;
@@ -390,12 +393,12 @@ body.sidebar-resizing * {
 
 /* -- Section Labels --------------------- */
 .section-label {
-  padding: 14px 14px 6px;
-  font-size: 9.5px;
-  font-weight: 700;
+  padding: 16px 14px 6px;
+  font-size: 11px;
+  font-weight: 600;
   color: var(--text-secondary);
-  text-transform: uppercase;
-  letter-spacing: 2px;
+  text-transform: none;
+  letter-spacing: -0.005em;
   display: flex;
   align-items: center;
   gap: 8px;
@@ -419,7 +422,7 @@ body.sidebar-resizing * {
   align-items: center;
   gap: 8px;
   margin: 2px 0;
-  padding: 10px 12px;
+  padding: 9px 12px;
   border-radius: var(--radius-sm);
   border: 1px solid var(--border);
   background: rgba(255, 255, 255, 0.04);
@@ -428,7 +431,7 @@ body.sidebar-resizing * {
   cursor: pointer;
   width: 100%;
   font-family: var(--mono);
-  font-size: 10.5px;
+  font-size: 11.5px;
   text-align: left;
   transition: all var(--transition);
   overflow: hidden;
@@ -592,8 +595,9 @@ body.sidebar-resizing * {
 }
 
 .project-name {
-  font-size: 12px;
-  font-weight: 600;
+  font-size: 12.5px;
+  font-weight: 590;
+  letter-spacing: -0.01em;
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -606,8 +610,9 @@ body.sidebar-resizing * {
   border-radius: 999px;
   background: rgba(255,255,255,0.05);
   color: var(--text-secondary);
-  font-size: 9px;
-  font-weight: 700;
+  font-size: 10px;
+  font-weight: 600;
+  font-feature-settings: 'tnum';
 }
 
 .project-action-btn {
@@ -705,7 +710,7 @@ body.sidebar-resizing * {
   display: flex;
   align-items: center;
   gap: 0;
-  padding: 9px 10px;
+  padding: 8px 10px;
   border-radius: var(--radius-sm);
   border: 1px solid transparent;
   background: transparent;
@@ -714,14 +719,15 @@ body.sidebar-resizing * {
   flex: 1;
   min-width: 0;
   font-family: var(--font);
-  font-size: 11.5px;
+  font-size: 12.5px;
+  letter-spacing: -0.01em;
   text-align: left;
   transition: color var(--transition), background var(--transition);
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
   position: relative;
-  opacity: 0.75;
+  opacity: 0.85;
 }
 .history-item:hover { color: var(--text); opacity: 1; }
 
@@ -2001,7 +2007,7 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
   to   { opacity: 1; transform: translateY(0) scale(1); }
 }
 
-.message + .message { margin-top: 6px; }
+.message + .message { margin-top: 14px; }
 
 .msg-header {
   display: flex;
@@ -2012,35 +2018,36 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
 }
 
 .msg-avatar {
-  width: 22px;
-  height: 22px;
-  border-radius: 6px;
+  width: 24px;
+  height: 24px;
+  border-radius: 7px;
   display: flex;
   align-items: center;
   justify-content: center;
-  font-size: 9px;
+  font-size: 10px;
   font-weight: 700;
   color: #fff;
   flex-shrink: 0;
 }
 
 .msg-name {
-  font-size: 10.5px;
+  font-size: 11.5px;
   font-weight: 600;
-  letter-spacing: 0.3px;
+  letter-spacing: -0.01em;
 }
 
 .msg-time {
-  font-size: 9.5px;
+  font-size: 10.5px;
   color: var(--text-secondary);
-  opacity: 0.6;
+  opacity: 0.7;
+  letter-spacing: -0.005em;
 }
 
 .msg-body {
   padding: 14px 18px;
   border-radius: var(--radius);
-  line-height: 1.7;
-  font-size: 13px;
+  line-height: 1.6;
+  font-size: 13.5px;
   user-select: text;
 }
 
@@ -2057,13 +2064,14 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
   width: fit-content;
   max-width: var(--bubble-max-user);
   margin-left: auto;
-  background: rgba(10, 132, 255, 0.1);
-  border: 1px solid rgba(10, 132, 255, 0.18);
-  border-radius: 18px 18px 4px 18px;
+  background: rgba(10, 132, 255, 0.12);
+  border: 1px solid rgba(10, 132, 255, 0.2);
+  border-radius: 18px 18px 6px 18px;
   white-space: pre-wrap;
   word-break: break-word;
-  padding: 11px 18px;
-  font-size: 13px;
+  padding: 10px 16px;
+  font-size: 13.5px;
+  line-height: 1.55;
   backdrop-filter: blur(12px);
 }
 
@@ -2143,10 +2151,10 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
   background: transparent;
   border: none;
   border-radius: 0;
-  padding: 4px 2px 18px;
-  border-left: 2px solid rgba(255, 255, 255, 0.08);
+  padding: 2px 2px 14px;
+  border-left: 2px solid rgba(255, 255, 255, 0.07);
   padding-left: 18px;
-  margin-left: 10px;
+  margin-left: 11px;
 }
 
 /* -- Error messages --------------------- */
@@ -3193,8 +3201,8 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
   background: var(--bg-elevated);
   backdrop-filter: var(--glass-blur);
   border: 1px solid var(--border);
-  border-radius: 20px;
-  padding: 12px 14px 12px 20px;
+  border-radius: 22px;
+  padding: 11px 14px 11px 18px;
   transition: border-color var(--transition), box-shadow var(--transition);
   box-shadow: var(--shadow-md);
 }
@@ -3214,9 +3222,10 @@ body.subagent-rail-resizing .question-subagent-resizer::after {
 
 #prompt-input {
   flex: 1; border: none; background: transparent;
-  color: var(--text); font-family: var(--font); font-size: 13px;
+  color: var(--text); font-family: var(--font); font-size: 13.5px;
   resize: none; outline: none;
   line-height: 1.55;
+  letter-spacing: -0.01em;
   max-height: 160px;
   scrollbar-width: thin;
   scrollbar-color: rgba(255,255,255,0.03) transparent;
@@ -3923,7 +3932,7 @@ button:focus:not(:focus-visible) { outline: none; }
   flex-direction: column;
   background: var(--bg-elevated);
   border: 1px solid var(--border-light);
-  border-radius: var(--radius-sm);
+  border-radius: 14px;
   box-shadow: var(--shadow-lg);
   overflow: hidden;
 }
@@ -3996,9 +4005,10 @@ button:focus:not(:focus-visible) { outline: none; }
 
 .settings-section h4 {
   margin: 0 0 10px;
-  font-size: 11px;
-  letter-spacing: 0.6px;
-  text-transform: uppercase;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  text-transform: none;
   color: var(--text-secondary);
 }
 
@@ -4024,14 +4034,14 @@ button:focus:not(:focus-visible) { outline: none; }
 .settings-field input,
 .settings-field select {
   width: 100%;
-  min-height: 34px;
+  min-height: 32px;
   border: 1px solid var(--border);
   border-radius: var(--radius-xs);
   background: var(--bg-input);
   color: var(--text);
-  padding: 7px 9px;
+  padding: 6px 10px;
   font-family: var(--font);
-  font-size: 12px;
+  font-size: 12.5px;
   outline: none;
 }
 
