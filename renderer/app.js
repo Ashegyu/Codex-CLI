@@ -23,10 +23,13 @@
       agentName: String(raw.agentName || '서브에이전트'),
       description: String(raw.description || ''),
       prompt: String(raw.prompt || ''),
+      turnId: typeof raw.turnId === 'string' ? raw.turnId : '',
+      turnPrompt: typeof raw.turnPrompt === 'string' ? raw.turnPrompt : '',
       status: ['running', 'completed', 'error', 'pending'].includes(status) ? status : 'pending',
       result: String(raw.result || ''),
       error: String(raw.error || ''),
       codexSessionId: typeof raw.codexSessionId === 'string' ? raw.codexSessionId : '',
+      currentActivity: String(raw.currentActivity || ''),
       startedAt: Number.isFinite(Number(raw.startedAt)) ? Number(raw.startedAt) : Date.now(),
       finishedAt: Number.isFinite(Number(raw.finishedAt)) ? Number(raw.finishedAt) : 0,
       elapsedMs: Number.isFinite(Number(raw.elapsedMs)) ? Number(raw.elapsedMs) : 0,
@@ -78,6 +81,7 @@
             content: typeof msg.content === 'string' ? msg.content : '',
             profileId: 'codex',
             timestamp: Number.isFinite(Number(msg.timestamp)) ? Number(msg.timestamp) : Date.now(),
+            turnId: typeof msg.turnId === 'string' ? msg.turnId : '',
             attachments: attachments.length ? attachments : undefined,
             actualCodeDiffs,
             actualCodeDiffsFetchedAt,
@@ -101,6 +105,15 @@
       const subagentRailWidthPx = Number(item.subagentRailWidthPx);
       if (Number.isFinite(subagentRailWidthPx) && subagentRailWidthPx > 0) {
         normalizedConv.subagentRailWidthPx = Math.round(subagentRailWidthPx);
+      }
+      if (item.subagentRailWidths && typeof item.subagentRailWidths === 'object' && !Array.isArray(item.subagentRailWidths)) {
+        const widths = {};
+        for (const [turnId, width] of Object.entries(item.subagentRailWidths)) {
+          const key = String(turnId || '').trim();
+          const numeric = Number(width);
+          if (key && Number.isFinite(numeric) && numeric > 0) widths[key] = Math.round(numeric);
+        }
+        if (Object.keys(widths).length > 0) normalizedConv.subagentRailWidths = widths;
       }
       normalized.push(normalizedConv);
     }
@@ -4259,10 +4272,14 @@
     saveSidebarPrefs();
   }
 
-  function clampSubagentRailWidth(value) {
+  function clampSubagentRailWidth(value, containerEl = null) {
     const numeric = Number(value);
     if (!Number.isFinite(numeric)) return SUBAGENT_RAIL_DEFAULT_WIDTH;
-    const splitWidth = Number($conversationSplit?.clientWidth) || window.innerWidth || 0;
+    const splitWidth = Number(containerEl?.clientWidth)
+      || Number($conversationSplit?.clientWidth)
+      || Number($messages?.clientWidth)
+      || window.innerWidth
+      || 0;
     const maxByViewport = splitWidth > 0
       ? Math.max(SUBAGENT_RAIL_MIN_WIDTH, splitWidth - SUBAGENT_RAIL_MIN_MAIN_WIDTH)
       : SUBAGENT_RAIL_MAX_WIDTH;
@@ -4310,6 +4327,7 @@
     if (e.button != null && e.button !== 0) return;
     e.preventDefault();
     subagentRailResizeSession = {
+      scope: 'conversation',
       startX: e.clientX,
       startWidth: $subagentRail.getBoundingClientRect().width || subagentRailWidthPx || SUBAGENT_RAIL_DEFAULT_WIDTH,
     };
@@ -4322,18 +4340,50 @@
   function onSubagentRailResizeMove(e) {
     if (!subagentRailResizeSession) return;
     const delta = e.clientX - subagentRailResizeSession.startX;
-    subagentRailWidthPx = clampSubagentRailWidth(subagentRailResizeSession.startWidth - delta);
+    const nextWidth = subagentRailResizeSession.startWidth - delta;
+    if (subagentRailResizeSession.scope === 'turn') {
+      applyTurnSubagentRailWidth(subagentRailResizeSession.layout, nextWidth);
+      subagentRailResizeSession.currentWidth = clampSubagentRailWidth(nextWidth, subagentRailResizeSession.layout);
+      return;
+    }
+    subagentRailWidthPx = clampSubagentRailWidth(nextWidth);
     applySubagentRailWidth();
   }
 
   function endSubagentRailResize() {
     if (!subagentRailResizeSession) return;
+    const session = subagentRailResizeSession;
     subagentRailResizeSession = null;
     document.body.classList.remove('subagent-rail-resizing');
     window.removeEventListener('pointermove', onSubagentRailResizeMove);
     window.removeEventListener('pointerup', endSubagentRailResize);
     window.removeEventListener('pointercancel', endSubagentRailResize);
+    if (session.scope === 'turn') {
+      saveTurnSubagentRailWidth(session.turnId, session.currentWidth || session.startWidth);
+      return;
+    }
     saveSubagentRailWidth();
+  }
+
+  function beginQuestionSubagentRailResize(e, resizer) {
+    const layout = resizer?.closest('.question-turn-layout');
+    const rail = layout?.querySelector('.question-subagent-rail');
+    if (!layout || !rail) return;
+    if (e.button != null && e.button !== 0) return;
+    e.preventDefault();
+    const startWidth = rail.getBoundingClientRect().width || getTurnSubagentRailWidth(getActiveConversation(), layout.dataset.turnId, layout);
+    subagentRailResizeSession = {
+      scope: 'turn',
+      turnId: String(layout.dataset.turnId || ''),
+      layout,
+      startX: e.clientX,
+      startWidth,
+      currentWidth: startWidth,
+    };
+    document.body.classList.add('subagent-rail-resizing');
+    window.addEventListener('pointermove', onSubagentRailResizeMove);
+    window.addEventListener('pointerup', endSubagentRailResize);
+    window.addEventListener('pointercancel', endSubagentRailResize);
   }
 
   function resetSubagentRailWidth() {
@@ -4342,21 +4392,32 @@
     clearConversationSubagentRailWidth();
   }
 
+  function resetQuestionSubagentRailWidth(resizer) {
+    const layout = resizer?.closest('.question-turn-layout');
+    const turnId = String(layout?.dataset?.turnId || '').trim();
+    if (!layout || !turnId) return;
+    applyTurnSubagentRailWidth(layout, SUBAGENT_RAIL_DEFAULT_WIDTH);
+    clearTurnSubagentRailWidth(turnId);
+  }
+
   function initSubagentRailLayout() {
-    syncSubagentRailWidthFromConversation();
-    if ($subagentRailResizer) {
-      $subagentRailResizer.addEventListener('pointerdown', beginSubagentRailResize);
-      $subagentRailResizer.addEventListener('dblclick', resetSubagentRailWidth);
-    }
+    $messages?.addEventListener('pointerdown', (e) => {
+      const resizer = e.target.closest('.question-subagent-resizer');
+      if (!resizer) return;
+      beginQuestionSubagentRailResize(e, resizer);
+    });
+    $messages?.addEventListener('dblclick', (e) => {
+      const resizer = e.target.closest('.question-subagent-resizer');
+      if (!resizer) return;
+      resetQuestionSubagentRailWidth(resizer);
+    });
     window.addEventListener('resize', () => {
-      if (!Number.isFinite(subagentRailWidthPx)) return;
       const activeConv = getActiveConversation();
-      if (getSubagentPanelMessages(activeConv).length === 0) return;
-      const next = clampSubagentRailWidth(subagentRailWidthPx);
-      if (next !== subagentRailWidthPx) {
-        subagentRailWidthPx = next;
-        applySubagentRailWidth();
-        saveSubagentRailWidth();
+      if (!activeConv || getSubagentPanelMessages(activeConv).length === 0) return;
+      for (const layout of document.querySelectorAll('.question-turn-layout[data-turn-id]')) {
+        const turnId = String(layout.dataset.turnId || '');
+        const width = getTurnSubagentRailWidth(activeConv, turnId, layout);
+        applyTurnSubagentRailWidth(layout, width);
       }
     });
   }
@@ -5256,7 +5317,6 @@
     conversations.unshift(conv);
     _convMap.set(conv.id, conv);
     activeConvId = conv.id;
-    syncSubagentRailWidthFromConversation(conv);
     saveConversations();
     renderMessages();
     syncStreamingUI();
@@ -5423,17 +5483,24 @@
       if (!parentConv) return;
     }
 
+    const latestTurn = getLatestUserTurn(parentConv);
+    const turnId = String(options.turnId || latestTurn.turnId || '').trim()
+      || `turn_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`;
+    const turnPrompt = String(options.turnPrompt || latestTurn.turnPrompt || '').trim();
     const panelMsg = {
       id: `msg_${Date.now()}_sub_${Math.random().toString(16).slice(2, 6)}`,
       role: 'ai',
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      turnId,
       subagentPanel: {
         id: `subagent_${Date.now()}_${Math.random().toString(16).slice(2, 6)}`,
         agentName: agent.name,
         description: agent.description,
         prompt,
+        turnId,
+        turnPrompt,
         status: 'running',
         result: '',
         error: '',
@@ -5441,6 +5508,7 @@
         startedAt: Date.now(),
         finishedAt: 0,
         elapsedMs: 0,
+        currentActivity: '작업을 시작했습니다.',
         progressLines: [],
       },
     };
@@ -5449,7 +5517,7 @@
     saveConversations();
     if (activeConvId === parentConv.id) {
       $welcome.style.display = 'none';
-      renderSubagentRail(parentConv);
+      renderMessages();
       scrollToBottom({ force: true });
     }
 
@@ -5472,6 +5540,7 @@
     function updateSubagentProgress(options = {}) {
       panel.elapsedMs = Date.now() - panel.startedAt;
       panel.progressLines = subPreviewState.lines.slice(-80);
+      panel.currentActivity = getSubagentCurrentActivity(panel);
       updateSubagentPanelDom(panelMsg, parentConv.id, options);
     }
 
@@ -5494,7 +5563,10 @@
       if (type === 'status' || type === 'progress') {
         if (type === 'progress') {
           const normalized = normalizeDetailLine(String(chunk || ''));
-          if (normalized) pushStreamingPreviewLine(subPreviewState, normalized);
+          if (normalized) {
+            pushStreamingPreviewLine(subPreviewState, normalized);
+            panel.currentActivity = normalized;
+          }
         }
         updateSubagentProgress();
         return;
@@ -5519,6 +5591,9 @@
       panel.finishedAt = Date.now();
       panel.elapsedMs = panel.finishedAt - panel.startedAt;
       panel.progressLines = subPreviewState.lines.slice(-80);
+      panel.currentActivity = panel.status === 'completed'
+        ? '작업을 완료했습니다.'
+        : '실행 실패 상태를 확인 중입니다.';
       panelMsg.content = finalText;
 
       if (panel.status === 'error' && !panel.error) {
@@ -5543,6 +5618,7 @@
       panel.finishedAt = Date.now();
       panel.elapsedMs = panel.finishedAt - panel.startedAt;
       panel.progressLines = subPreviewState.lines.slice(-80);
+      panel.currentActivity = '오류를 확인 중입니다.';
       panelMsg.content = panel.result;
       saveConversations();
       updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
@@ -5572,6 +5648,7 @@
         panel.status = 'error';
         panel.finishedAt = Date.now();
         panel.elapsedMs = panel.finishedAt - panel.startedAt;
+        panel.currentActivity = '실행 시작 실패를 확인 중입니다.';
         panelMsg.content = panel.result;
         saveConversations();
         updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
@@ -5584,6 +5661,7 @@
       panel.status = 'error';
       panel.finishedAt = Date.now();
       panel.elapsedMs = panel.finishedAt - panel.startedAt;
+      panel.currentActivity = '실행 오류를 확인 중입니다.';
       panelMsg.content = panel.result;
       saveConversations();
       updateSubagentPanelDom(panelMsg, parentConv.id, { forceScroll: true });
@@ -5597,7 +5675,7 @@
     spawnedPrompts: new Set(), // 중복 방지
   };
 
-  function detectCodexAgentActivity(chunk, convId) {
+  function detectCodexAgentActivity(chunk, convId, options = {}) {
     const text = String(chunk || '');
     for (const line of text.split(/\r?\n/)) {
       const trimmed = line.trim();
@@ -5661,7 +5739,11 @@
             description: taskSummary || `Codex가 위임한 작업 #${agentNum}`,
             developer_instructions: '',
           };
-          spawnSubagent(fakeAgent, prompt, { parentConvId: convId });
+          spawnSubagent(fakeAgent, prompt, {
+            parentConvId: convId,
+            turnId: options.turnId,
+            turnPrompt: options.turnPrompt,
+          });
         }
       } catch { /* not JSON */ }
     }
@@ -5777,7 +5859,6 @@ ${userPrompt}
     try {
       activeConvId = id;
       const conv = getActiveConversation();
-      syncSubagentRailWidthFromConversation(conv);
       // 대화별 실행 모드 복원
       // 대화별 작업 폴더 복원
       if (conv && conv.cwd) {
@@ -5863,39 +5944,106 @@ ${userPrompt}
     return conv.messages.filter(msg => !msg?.subagentPanel);
   }
 
+  function getLatestUserTurn(conv) {
+    if (!conv || !Array.isArray(conv.messages)) return { turnId: '', turnPrompt: '' };
+    for (let i = conv.messages.length - 1; i >= 0; i--) {
+      const msg = conv.messages[i];
+      if (msg?.role === 'user') {
+        return {
+          turnId: String(msg.turnId || msg.id || '').trim(),
+          turnPrompt: String(msg.content || '').trim(),
+        };
+      }
+    }
+    return { turnId: '', turnPrompt: '' };
+  }
+
+  function ensureConversationTurnGroup(groups, groupMap, turnId, turnPrompt = '') {
+    const key = String(turnId || '').trim() || `turn_${groups.length + 1}`;
+    let group = groupMap.get(key);
+    if (!group) {
+      group = { turnId: key, turnPrompt: String(turnPrompt || '').trim(), messages: [], panels: [] };
+      groupMap.set(key, group);
+      groups.push(group);
+    } else if (!group.turnPrompt && turnPrompt) {
+      group.turnPrompt = String(turnPrompt || '').trim();
+    }
+    return group;
+  }
+
+  function buildConversationTurnGroups(conv) {
+    const groups = [];
+    const groupMap = new Map();
+    let currentTurnId = '';
+    let currentTurnPrompt = '';
+
+    for (const msg of Array.isArray(conv?.messages) ? conv.messages : []) {
+      if (!msg || typeof msg !== 'object') continue;
+
+      if (msg.subagentPanel) {
+        msg.subagentPanel = normalizeSubagentPanel(msg.subagentPanel);
+        if (!msg.subagentPanel) continue;
+        const panelTurnId = String(msg.subagentPanel.turnId || msg.turnId || currentTurnId || msg.id || '').trim();
+        const panelTurnPrompt = String(msg.subagentPanel.turnPrompt || currentTurnPrompt || '').trim();
+        msg.subagentPanel.turnId = panelTurnId;
+        msg.subagentPanel.turnPrompt = panelTurnPrompt;
+        msg.turnId = panelTurnId;
+        ensureConversationTurnGroup(groups, groupMap, panelTurnId, panelTurnPrompt).panels.push(msg);
+        continue;
+      }
+
+      const isUser = msg.role === 'user';
+      const turnId = String(msg.turnId || (isUser ? msg.id : currentTurnId) || msg.id || '').trim();
+      const turnPrompt = isUser ? String(msg.content || '').trim() : currentTurnPrompt;
+      msg.turnId = turnId;
+      if (isUser) {
+        currentTurnId = turnId;
+        currentTurnPrompt = turnPrompt;
+      }
+      ensureConversationTurnGroup(groups, groupMap, turnId, turnPrompt).messages.push(msg);
+    }
+
+    return groups.filter(group => group.messages.length > 0 || group.panels.length > 0);
+  }
+
   // === 메시지 렌더링 ===
   function renderMessages() {
     const conv = getActiveConversation();
-    const mainMessages = getConversationMainMessages(conv);
     if (!conv || conv.messages.length === 0) {
       $welcome.style.display = '';
       $messages.querySelectorAll('.message').forEach(el => el.remove());
-      renderSubagentRail(null);
+      hideGlobalSubagentRail();
       return;
     }
     $welcome.style.display = 'none';
+    hideGlobalSubagentRail();
 
     // 기존 메시지 요소 일괄 제거
-    $messages.querySelectorAll('.message').forEach(el => el.remove());
+    $messages.querySelectorAll('.message, .question-turn-layout').forEach(el => el.remove());
 
     // DocumentFragment로 일괄 삽입 → reflow 1회만 발생
     const frag = document.createDocumentFragment();
-    for (const msg of mainMessages) {
+    const turnGroups = buildConversationTurnGroups(conv);
+    for (const group of turnGroups) {
       try {
-        const el = appendMessageDOM(msg, frag);
-        if (convStreams.has(activeConvId)) {
-          const st = convStreams.get(activeConvId);
-          if (st.streamId === msg.id) {
-            el.classList.add('streaming');
-            st.liveAiEl = el;
+        const targetParent = group.panels.length > 0
+          ? appendQuestionTurnLayout(group, frag)
+          : frag;
+        for (const msg of group.messages) {
+          const el = appendMessageDOM(msg, targetParent);
+          if (convStreams.has(activeConvId)) {
+            const st = convStreams.get(activeConvId);
+            if (st.streamId === msg.id) {
+              el.classList.add('streaming');
+              st.liveAiEl = el;
+            }
           }
         }
       } catch (err) {
-        console.error('[renderMessages] skip message:', err, msg?.id);
+        console.error('[renderMessages] skip turn:', err, group?.turnId);
       }
     }
     $messages.appendChild(frag);
-    renderSubagentRail(conv);
     scrollToBottom({ force: true });
   }
 
@@ -10140,6 +10288,44 @@ ${userPrompt}
     return preview.length > 1800 ? `${preview.slice(0, 1800).trimEnd()}\n...` : preview;
   }
 
+  function getSubagentProgressSteps(panel, limit = 6) {
+    const source = Array.isArray(panel?.progressLines) ? panel.progressLines : [];
+    const seen = new Set();
+    const steps = [];
+    for (const line of source.slice().reverse()) {
+      const normalized = normalizeDetailLine(line);
+      if (!normalized || seen.has(normalized)) continue;
+      seen.add(normalized);
+      steps.push(normalized);
+      if (steps.length >= limit) break;
+    }
+    return steps.reverse();
+  }
+
+  function getSubagentCurrentActivity(panel) {
+    const latestStep = getSubagentProgressSteps(panel, 1)[0];
+    if (panel?.status === 'running' && latestStep) return latestStep;
+    const explicit = normalizeDetailLine(panel?.currentActivity || '');
+    if (explicit) return explicit;
+    if (latestStep) return latestStep;
+    if (panel?.status === 'running') return '작업을 준비 중입니다.';
+    if (panel?.status === 'completed') return '작업을 완료했습니다.';
+    if (panel?.status === 'error') return '오류 상태를 확인 중입니다.';
+    return '대기 중입니다.';
+  }
+
+  function renderSubagentProgressTimeline(panel) {
+    const steps = getSubagentProgressSteps(panel, 6);
+    if (steps.length === 0) {
+      return '<ol class="subagent-process-list"><li class="subagent-process-empty"><span class="subagent-process-text">중간 과정 수신 대기 중입니다.</span></li></ol>';
+    }
+    return `<ol class="subagent-process-list">${steps.map((step, idx) => `
+      <li>
+        <span class="subagent-process-index">${String(idx + 1).padStart(2, '0')}</span>
+        <span class="subagent-process-text">${escapeHtml(step)}</span>
+      </li>`).join('')}</ol>`;
+  }
+
   function getSubagentRailToolLabel(panel) {
     const lines = Array.isArray(panel.progressLines) ? panel.progressLines : [];
     const source = lines.join('\n');
@@ -10163,6 +10349,8 @@ ${userPrompt}
       : '진행 결과';
     const excerpt = getSubagentRailExcerpt(panel);
     const toolLabel = getSubagentRailToolLabel(panel);
+    const currentActivity = getSubagentCurrentActivity(panel);
+    const processTimelineHtml = renderSubagentProgressTimeline(panel);
 
     return `<article class="subagent-rail-card subagent-${status.className}" data-subagent-msg-id="${escapeHtml(msg.id || '')}">
       <header class="subagent-rail-header">
@@ -10178,12 +10366,152 @@ ${userPrompt}
         <span>${escapeHtml(toolLabel)}</span>
         <span class="subagent-rail-elapsed">${escapeHtml(formatSubagentElapsed(elapsedMs))}</span>
       </div>
+      <div class="subagent-current-work">
+        <div class="subagent-current-label">현재 작업</div>
+        <div class="subagent-current-text">${escapeHtml(currentActivity)}</div>
+      </div>
+      <div class="subagent-process">
+        <div class="subagent-process-title">중간 과정</div>
+        ${processTimelineHtml}
+      </div>
       <div class="subagent-rail-output">
         <div class="subagent-rail-output-title">${escapeHtml(outputTitle)}</div>
         <pre>${escapeHtml(excerpt)}</pre>
       </div>
       ${panel.error ? `<div class="subagent-rail-error">${escapeHtml(panel.error)}</div>` : ''}
     </article>`;
+  }
+
+  function hideGlobalSubagentRail() {
+    if ($conversationSplit) $conversationSplit.classList.remove('has-subagents');
+    if ($subagentRail) {
+      $subagentRail.classList.add('hidden');
+      $subagentRail.innerHTML = '';
+    }
+  }
+
+  function getTurnSubagentRailWidth(conv, turnId, layoutEl = null) {
+    const widths = conv?.subagentRailWidths && typeof conv.subagentRailWidths === 'object'
+      ? conv.subagentRailWidths
+      : {};
+    const stored = Number(widths[String(turnId || '')]);
+    return clampSubagentRailWidth(
+      Number.isFinite(stored) && stored > 0 ? stored : SUBAGENT_RAIL_DEFAULT_WIDTH,
+      layoutEl
+    );
+  }
+
+  function applyTurnSubagentRailWidth(layoutEl, width) {
+    if (!layoutEl) return;
+    const clamped = clampSubagentRailWidth(width, layoutEl);
+    layoutEl.style.setProperty('--turn-subagent-rail-width', `${clamped}px`);
+  }
+
+  function saveTurnSubagentRailWidth(turnId, width, conv = getActiveConversation()) {
+    const key = String(turnId || '').trim();
+    if (!conv || !key) return;
+    const clamped = clampSubagentRailWidth(width, findQuestionTurnLayout(key));
+    if (!conv.subagentRailWidths || typeof conv.subagentRailWidths !== 'object') {
+      conv.subagentRailWidths = {};
+    }
+    if (conv.subagentRailWidths[key] === clamped) return;
+    conv.subagentRailWidths[key] = clamped;
+    saveConversations();
+  }
+
+  function clearTurnSubagentRailWidth(turnId, conv = getActiveConversation()) {
+    const key = String(turnId || '').trim();
+    if (!conv?.subagentRailWidths || !key) return;
+    if (!Object.prototype.hasOwnProperty.call(conv.subagentRailWidths, key)) return;
+    delete conv.subagentRailWidths[key];
+    if (Object.keys(conv.subagentRailWidths).length === 0) delete conv.subagentRailWidths;
+    saveConversations();
+  }
+
+  function getSubagentPanelsForTurn(conv, turnId) {
+    const key = String(turnId || '').trim();
+    return getSubagentPanelMessages(conv)
+      .filter(msg => String(msg?.subagentPanel?.turnId || msg?.turnId || '').trim() === key)
+      .map(msg => {
+        msg.subagentPanel = normalizeSubagentPanel(msg.subagentPanel);
+        return msg;
+      })
+      .filter(msg => msg.subagentPanel);
+  }
+
+  function sortSubagentPanelMessages(panels) {
+    const statusRank = { running: 0, pending: 1, error: 2, completed: 3 };
+    return (Array.isArray(panels) ? panels : []).slice().sort((a, b) => {
+      const rankA = statusRank[a.subagentPanel?.status] ?? 9;
+      const rankB = statusRank[b.subagentPanel?.status] ?? 9;
+      if (rankA !== rankB) return rankA - rankB;
+      return Number(a.timestamp || 0) - Number(b.timestamp || 0);
+    });
+  }
+
+  function renderSubagentRailListHtml(panels) {
+    return `<div class="subagent-rail-list">
+      ${sortSubagentPanelMessages(panels).map(renderSubagentRailCard).join('')}
+    </div>`;
+  }
+
+  function appendQuestionTurnLayout(group, targetParent) {
+    const conv = getActiveConversation();
+    const layout = document.createElement('section');
+    layout.className = 'question-turn-layout has-subagents';
+    layout.dataset.turnId = group.turnId;
+    applyTurnSubagentRailWidth(layout, getTurnSubagentRailWidth(conv, group.turnId, layout));
+
+    const main = document.createElement('div');
+    main.className = 'question-turn-main';
+
+    const resizer = document.createElement('div');
+    resizer.className = 'question-subagent-resizer';
+    resizer.dataset.turnId = group.turnId;
+    resizer.setAttribute('role', 'separator');
+    resizer.setAttribute('aria-orientation', 'vertical');
+    resizer.setAttribute('aria-label', '이 질문의 서브에이전트 패널 너비 조절');
+    resizer.title = '이 질문의 패널 너비 조절 · 더블클릭으로 초기화';
+
+    const rail = document.createElement('aside');
+    rail.className = 'question-subagent-rail';
+    rail.dataset.turnId = group.turnId;
+    rail.setAttribute('aria-label', '이 질문의 서브에이전트 진행 패널');
+    rail.innerHTML = renderSubagentRailListHtml(group.panels);
+
+    layout.appendChild(main);
+    layout.appendChild(resizer);
+    layout.appendChild(rail);
+    (targetParent || $messages).appendChild(layout);
+    return main;
+  }
+
+  function findQuestionTurnLayout(turnId) {
+    const key = String(turnId || '').trim();
+    if (!key) return null;
+    const layouts = document.querySelectorAll('.question-turn-layout[data-turn-id]');
+    for (const layout of layouts) {
+      if (String(layout.dataset.turnId || '') === key) return layout;
+    }
+    return null;
+  }
+
+  function updateQuestionSubagentRailDom(parentConvId, turnId) {
+    if (activeConvId !== parentConvId) return;
+    const conv = _convMap.get(parentConvId);
+    const panels = getSubagentPanelsForTurn(conv, turnId);
+    const layout = findQuestionTurnLayout(turnId);
+    if (!layout || panels.length === 0) {
+      renderMessages();
+      return;
+    }
+    const rail = layout.querySelector('.question-subagent-rail');
+    if (!rail) {
+      renderMessages();
+      return;
+    }
+    applyTurnSubagentRailWidth(layout, getTurnSubagentRailWidth(conv, turnId, layout));
+    rail.innerHTML = renderSubagentRailListHtml(panels);
   }
 
   function renderSubagentRail(conv) {
@@ -10221,7 +10549,7 @@ ${userPrompt}
     if (!panelMsg?.subagentPanel) return;
     panelMsg.subagentPanel = normalizeSubagentPanel(panelMsg.subagentPanel);
     if (activeConvId !== parentConvId) return;
-    renderSubagentRail(_convMap.get(parentConvId));
+    updateQuestionSubagentRailDom(parentConvId, panelMsg.subagentPanel.turnId || panelMsg.turnId);
     if (options.forceScroll) scrollToBottom({ force: true });
     else scrollToBottom();
   }
@@ -10519,12 +10847,14 @@ ${userPrompt}
       conv.cwd = currentCwd;
     }
 
+    const userMsgId = `msg_${Date.now()}`;
     const userMsg = {
-      id: `msg_${Date.now()}`,
+      id: userMsgId,
       role: 'user',
       content: promptText,
       profileId: activeProfileId,
       timestamp: Date.now(),
+      turnId: userMsgId,
       attachments: sentAttachments.length ? sentAttachments : undefined,
     };
     conv.messages.push(userMsg);
@@ -10538,6 +10868,7 @@ ${userPrompt}
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      turnId: userMsgId,
       actualCodeDiffs: [],
       actualCodeDiffsFetchedAt: 0,
     };
@@ -10638,7 +10969,7 @@ ${userPrompt}
       autoSaveIfNeeded();
 
       // Codex 내부 에이전트 활동 감지 (방식 1)
-      detectCodexAgentActivity(chunk, convId);
+      detectCodexAgentActivity(chunk, convId, { turnId: userMsgId, turnPrompt: promptText });
 
       // 승인 요청 감지 (runCodexWithExtraArgs)
       if (approvalPolicy !== 'auto-approve') {
@@ -11005,12 +11336,14 @@ ${userPrompt}
     }
 
     // 사용자 메시지 추가
+    const userMsgId = `msg_${Date.now()}`;
     const userMsg = {
-      id: `msg_${Date.now()}`,
+      id: userMsgId,
       role: 'user',
       content: promptText,
       profileId: activeProfileId,
       timestamp: Date.now(),
+      turnId: userMsgId,
       attachments: sentAttachments.length ? sentAttachments : undefined,
     };
     conv.messages.push(userMsg);
@@ -11027,6 +11360,7 @@ ${userPrompt}
       content: '',
       profileId: activeProfileId,
       timestamp: Date.now(),
+      turnId: userMsgId,
       actualCodeDiffs: [],
       actualCodeDiffsFetchedAt: 0,
     };
@@ -11212,7 +11546,7 @@ ${userPrompt}
       autoSaveIfNeeded();
 
       // Codex 내부 에이전트 활동 감지 (방식 1)
-      detectCodexAgentActivity(chunk, convId);
+      detectCodexAgentActivity(chunk, convId, { turnId: userMsgId, turnPrompt: promptText });
 
       // 승인 요청 감지
       if (approvalPolicy !== 'auto-approve') {
